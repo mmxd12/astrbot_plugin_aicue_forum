@@ -1,7 +1,7 @@
 name: astrbot_plugin_aicue_forum
 display_name: 言灵工坊论坛推送
-desc: 监控言灵工坊中转站帖子，向指定群推送图文链接并以本人账号自动回帖，支持最新和热门帖子查询。
-version: v1.2.3
+desc: 分类监控言灵工坊多个标签的新帖，向指定群汇总推送图文链接并自动回帖，支持八个分类的热门和最新帖子查询。
+version: v1.5.1
 author: mmxd
 astrbot_version: ">=4.16,<5"
 repo: https://github.com/mmxd12/astrbot_plugin_aicue_forum
