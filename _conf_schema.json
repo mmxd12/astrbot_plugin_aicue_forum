@@ -1,0 +1,12 @@
+{
+  "forum_url": {"description": "论坛地址", "type": "string", "default": "https://flarum.aicue.top", "hint": "一般无需修改。"},
+  "forum_username": {"description": "论坛用户名或邮箱", "type": "string", "default": "", "hint": "用于登录论坛并以本人账号自动回帖。建议填写论坛用户名。"},
+  "forum_password": {"description": "论坛密码", "type": "string", "default": "", "obvious_hint": true, "hint": "敏感信息，会以明文保存在 AstrBot 配置文件中；登录 Cookie 仅在运行内存中维护。请保护配置文件权限。"},
+  "tag_slug": {"description": "监控标签 Slug", "type": "string", "default": "transit", "hint": "中转站标签当前为 transit。"},
+  "check_interval_seconds": {"description": "检查间隔（秒）", "type": "int", "default": 120, "hint": "最低按 30 秒执行。"},
+  "reply_text": {"description": "推送成功后的论坛回复", "type": "string", "default": "已推送至群中"},
+  "excerpt_length": {"description": "正文摘要最大字数", "type": "int", "default": 500},
+  "max_images": {"description": "每帖最多推送图片数", "type": "int", "default": 3},
+  "search_result_count": {"description": "最近帖子返回数量", "type": "int", "default": 5},
+  "qq_daily_push_limit": {"description": "官 Q 每日自动推送上限", "type": "int", "default": 1000, "hint": "只限制 QQ 官方 API 平台；超额帖子进入 /最新帖子 待发列表，其他平台不受影响。"}
+}
