@@ -2,6 +2,7 @@ import asyncio
 import base64
 import html
 import re
+import random
 import secrets
 import shutil
 from datetime import datetime, timedelta, timezone
@@ -14,8 +15,9 @@ from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, StarTools, register
 import astrbot.api.message_components as Comp
+from botpy.types.message import MarkdownPayload
 
-BASE_DEFAULT = "https://flarum.aicue.top"
+BASE_DEFAULT = "https://www.aicue.top"
 TAG_NAMES = {
     "announcements": "公告",
     "transit": "中转站",
@@ -23,7 +25,7 @@ TAG_NAMES = {
     "jailbreak-prompts": "破甲词",
     "latest-news": "最新资讯",
     "tech-discussion": "技术讨论",
-    "resource-share": "资源分析",
+    "resource-share": "资源分享",
     "off-topic": "灌水区",
 }
 TAG_ALIASES = {
@@ -115,7 +117,7 @@ class MarkdownPlain(Comp.Plain):
         return {"type": "markdown", "data": {"content": self.text}}
 
 
-@register("astrbot_plugin_aicue_forum", "mmxd", "言灵工坊中转站帖子监控与查询", "1.5.2")
+@register("astrbot_plugin_aicue_forum", "mmxd", "言灵工坊中转站帖子监控与查询", "1.5.9")
 class AicueForumPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig = None):
         super().__init__(context)
@@ -252,7 +254,8 @@ class AicueForumPlugin(Star):
     async def discussions(self, *, tag=None, sort="-createdAt", limit=20, offset=0):
         params = {"sort": sort, "page[limit]": limit, "page[offset]": offset, "include": "user,tags"}
         if tag:
-            params["filter[tag]"] = tag
+            # 论坛后台的资源分享 slug 末尾误带制表符，兼容到后台修正为止。
+            params["filter[tag]"] = "resource-share	" if tag == "resource-share" else tag
         doc = await self.api("discussions?" + urlencode(params))
         users = {x["id"]: x.get("attributes", {}).get("displayName", "未知用户") for x in doc.get("included", []) if x.get("type") == "users"}
         for row in doc["data"]:
@@ -298,7 +301,8 @@ class AicueForumPlugin(Star):
             excerpt += "……"
         try:
             image_url = await self.html_render(
-                """<div style="width:960px;padding:30px;background:#f7f9fb;font-family:'Microsoft YaHei',sans-serif;color:#24384a">
+                """<style>html,body{margin:0;padding:0}</style>
+                <div style="width:960px;height:400px;overflow:hidden;background:white;font-family:'Microsoft YaHei',sans-serif;color:#24384a">
                 <div style="background:#2875b5;color:white;padding:18px 28px;font-size:27px;font-weight:600">言灵工坊 · 中转站</div>
                 <div style="background:#20a4b7;color:white;padding:38px 34px;font-size:31px;text-align:center">{{ title | e }}</div>
                 <div style="background:white;padding:34px;font-size:22px;line-height:1.75">
@@ -312,7 +316,12 @@ class AicueForumPlugin(Star):
                     "content": excerpt or "（暂无正文）",
                 },
                 return_url=True,
-                options={"type": "jpeg", "quality": 80, "full_page": True},
+                options={
+                    "type": "jpeg",
+                    "quality": 80,
+                    "full_page": True,
+                    "clip": {"x": 0, "y": 0, "width": 960, "height": 400},
+                },
             )
             if not str(image_url).startswith(("http://", "https://")):
                 raise RuntimeError("截图服务未返回图片 URL")
@@ -381,15 +390,20 @@ class AicueForumPlugin(Star):
         mime = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".gif": "image/gif", ".webp": "image/webp"}.get(suffix, "image/png")
         content = await asyncio.to_thread(path.read_bytes)
         data_url = f"data:{mime};base64,{base64.b64encode(content).decode()}"
+        width, height = 1280, 720
         image_url = await self.html_render(
-            '<div style="margin:0;width:960px"><img src="{{ image }}" style="display:block;width:960px;height:auto"></div>',
+            """<style>*{box-sizing:border-box}html,body{margin:0;width:1280px;height:720px;overflow:hidden;background:#111}</style>
+            <div style="position:relative;width:1280px;height:720px;overflow:hidden">
+              <img src="{{ image }}" style="position:absolute;inset:-32px;width:1344px;height:784px;object-fit:cover;filter:blur(24px);opacity:.72">
+              <img src="{{ image }}" style="position:absolute;inset:0;width:100%;height:100%;object-fit:contain">
+            </div>""",
             {"image": data_url},
             return_url=True,
             options={"type": "jpeg", "quality": 85, "full_page": True},
         )
         if not str(image_url).startswith(("http://", "https://")):
             raise RuntimeError("T2I 未返回公网图片 URL")
-        return str(image_url)
+        return str(image_url), width, height
 
     def fallback_query_chain(self, texts):
         parts = []
@@ -404,8 +418,11 @@ class AicueForumPlugin(Star):
 
     async def public_query_chain(self, texts):
         try:
-            urls = await asyncio.gather(*(self.advertisement_public_url() for _ in texts))
-            content = "\n\n".join(f"![论坛图片]({url})\n\n{text}" for url, text in zip(urls, texts))
+            images = await asyncio.gather(*(self.advertisement_public_url() for _ in texts))
+            content = "\n\n".join(
+                f"![论坛图片 #{width}px #{height}px]({url})\n\n{text}"
+                for (url, width, height), text in zip(images, texts)
+            )
             chain = MessageChain([MarkdownPlain(content)])
             chain.use_markdown_ = True
             return chain
@@ -477,13 +494,84 @@ class AicueForumPlugin(Star):
                 title = str(attrs["title"]).replace("[", "\\[").replace("]", "\\]")
                 post_url = f"{self.base}/d/{attrs['slug']}"
                 lines.append(
-                    f"![帖子截图 #1280px #720px]({image_url})\n"
+                    f"![帖子截图 #960px #400px]({image_url})\n"
                     f"[{title} ↗]({post_url})\n"
                     f"-- {attrs.get('author', '未知用户')}"
                 )
         chain = MessageChain([MarkdownPlain("\n\n".join(lines))])
         chain.use_markdown_ = True
         return chain
+
+    async def monitor_public_chain(self, grouped):
+        parts = []
+        for tag in self.tag_slugs():
+            rows = grouped.get(tag, [])
+            if not rows:
+                continue
+            if parts:
+                parts.append(Comp.Plain(chr(10) * 2))
+            parts.append(Comp.Plain(f"{TAG_NAMES.get(tag, tag)}最新帖子：" + chr(10)))
+            for row in rows:
+                attrs = row["attributes"]
+                image_url = await self.post_chain(
+                    await self.detail(str(row["id"])), return_public_url=True
+                )
+                parts.extend([
+                    Comp.Image.fromURL(image_url),
+                    Comp.Plain(
+                        chr(10).join([
+                            "",
+                            f"标题：{attrs['title']}",
+                            f"链接：{self.base}/d/{attrs['slug']}",
+                            f"作者：{attrs.get('author', '未知用户')}",
+                            "",
+                        ])
+                    ),
+                ])
+        chain = MessageChain(parts)
+        chain.use_markdown_ = False
+        return chain
+
+    async def monitor_delivery_chains(self, grouped):
+        markdown_lines = []
+        fallback_parts = []
+        for tag in self.tag_slugs():
+            rows = grouped.get(tag, [])
+            if not rows:
+                continue
+            heading = f"{TAG_NAMES.get(tag, tag)}最新帖子："
+            markdown_lines.append(heading)
+            if fallback_parts:
+                fallback_parts.append(Comp.Plain(chr(10) * 2))
+            fallback_parts.append(Comp.Plain(heading + chr(10)))
+            for row in rows:
+                attrs = row["attributes"]
+                image_url = await self.post_chain(
+                    await self.detail(str(row["id"])), return_public_url=True
+                )
+                title = str(attrs["title"]).replace("[", "\\[").replace("]", "\\]")
+                post_url = f"{self.base}/d/{attrs['slug']}"
+                author = attrs.get("author", "未知用户")
+                markdown_lines.append(chr(10).join([
+                    f"![帖子截图 #960px #400px]({image_url})",
+                    f"[{title} ↗]({post_url})",
+                    f"-- {author}",
+                ]))
+                fallback_parts.extend([
+                    Comp.Image.fromURL(image_url),
+                    Comp.Plain(chr(10).join([
+                        "",
+                        f"标题：{attrs['title']}",
+                        f"链接：{post_url}",
+                        f"作者：{author}",
+                        "",
+                    ])),
+                ])
+        markdown_chain = MessageChain([MarkdownPlain((chr(10) * 2).join(markdown_lines))])
+        markdown_chain.use_markdown_ = True
+        fallback_chain = MessageChain(fallback_parts)
+        fallback_chain.use_markdown_ = False
+        return markdown_chain, fallback_chain
 
     async def monitor_chain(self, grouped, screenshots):
         parts = []
@@ -553,6 +641,41 @@ class AicueForumPlugin(Star):
             platform.remember_session_message_id(session_id, message_id)
         cached_id = getattr(platform, "_session_last_message_id", {}).get(session_id)
         return scene == "group" or bool(cached_id)
+
+    async def send_qq_markdown_target(self, target, markdown_chain, fallback_chain):
+        if not await self.prepare_qq_target(target):
+            logger.warning("官 Q 目标 %s 缺少会话场景/消息缓存，保留待重试", target)
+            return False
+        platform = self.target_platform(target)
+        parts = str(target).split(":", 2)
+        if not platform or len(parts) != 3 or not parts[2]:
+            return False
+        session_id = parts[2]
+        scene = getattr(platform, "_session_scene", {}).get(session_id)
+        if scene != "group":
+            return await self.send_target(target, fallback_chain)
+        content = "".join(
+            part.text for part in markdown_chain.chain if isinstance(part, Comp.Plain)
+        )
+        try:
+            ret = await platform.client.api.post_group_message(
+                group_openid=session_id,
+                markdown=MarkdownPayload(content=content),
+                msg_type=2,
+                msg_seq=random.randint(1, 10000),
+            )
+        except Exception as exc:
+            if "不允许发送原生 markdown" not in str(exc):
+                logger.exception("官 Q Markdown 推送失败，保留待重试：%s", target)
+                return False
+            logger.warning("官 Q 不允许发送原生 Markdown，改用普通富媒体：%s", target)
+            return await self.send_target(target, fallback_chain)
+        sent_id = platform._extract_message_id(ret)
+        if not sent_id:
+            logger.warning("官 Q Markdown 推送未返回消息 ID，保留待重试：%s", target)
+            return False
+        platform.remember_session_message_id(session_id, sent_id)
+        return True
 
     async def send_target(self, target, chain):
         if not await self.prepare_qq_target(target):
@@ -824,15 +947,14 @@ class AicueForumPlugin(Star):
                     grouped.setdefault(row["_monitor_tag"], []).append(row)
                 try:
                     if self.is_qq_official_target(target):
-                        try:
-                            sent = await self.send_target(target, await self.monitor_markdown_chain(grouped))
-                        except Exception as exc:
-                            logger.warning("官 Q Markdown 推送失败，改用普通文本: %s", exc)
-                            sent = False
-                        if not sent:
-                            sent = await self.send_target(target, self.monitor_text_chain(grouped))
+                        markdown_chain, fallback_chain = await self.monitor_delivery_chains(grouped)
+                        sent = await self.send_qq_markdown_target(
+                            target, markdown_chain, fallback_chain
+                        )
                     else:
-                        sent = await self.send_target(target, await self.monitor_chain(grouped, screenshots))
+                        sent = await self.send_target(
+                            target, await self.monitor_chain(grouped, screenshots)
+                        )
                     if not sent:
                         continue
                     for row in eligible:
@@ -1051,13 +1173,88 @@ class AicueForumPlugin(Star):
             results.append(result)
         return results
 
+    async def category_delivery_chains(self, name, hot, recent):
+        newline = chr(10)
+        sections = [
+            f"{name}最火帖子：" + newline
+            + (newline.join(self.markdown_lines(hot, with_author=True)) or "暂无帖子"),
+            f"{name}最近帖子：" + newline
+            + (newline.join(self.markdown_lines(recent, with_author=True)) or "暂无帖子"),
+        ]
+        fallback_parts = []
+        image = self.advertisement_image() or Comp.Image.fromFileSystem(
+            Path(__file__).parent / "assets" / "forum_header.png"
+        )
+        fallback_parts.append(image)
+        lines = []
+        for title, rows in ((f"{name}最火帖子：", hot), (f"{name}最近帖子：", recent)):
+            lines.append(title)
+            if not rows:
+                lines.append("暂无帖子")
+                continue
+            for row in rows[:10]:
+                attrs = row["attributes"]
+                lines.append(newline.join([
+                    f"标题：{attrs['title']}",
+                    f"链接：{self.base}/d/{attrs['slug']}",
+                    f"作者：{attrs.get('author') or '未知用户'}",
+                ]))
+        fallback_parts.append(Comp.Plain(newline + (newline * 2).join(lines)))
+        fallback = MessageChain(fallback_parts)
+        fallback.use_markdown_ = False
+        try:
+            image_url, width, height = await self.advertisement_public_url()
+            markdown = MessageChain([MarkdownPlain(
+                f"![论坛图片 #{width}px #{height}px]({image_url})"
+                + newline * 2 + (newline * 2).join(sections)
+            )])
+            markdown.use_markdown_ = True
+            return markdown, fallback
+        except Exception as exc:
+            logger.warning("生成分类查询公网广告图失败，直接使用普通图文：%s", exc)
+            return None, fallback
+
+    async def send_qq_category(self, event, markdown, fallback):
+        if markdown is None:
+            await event.send(fallback)
+            return True
+        source = event.message_obj.raw_message
+        content = "".join(part.text for part in markdown.chain if isinstance(part, Comp.Plain))
+        payload = {
+            "markdown": MarkdownPayload(content=content),
+            "msg_type": 2,
+            "msg_id": event.message_obj.message_id,
+            "msg_seq": random.randint(1, 10000),
+        }
+        try:
+            if getattr(source, "group_openid", None):
+                await event.bot.api.post_group_message(
+                    group_openid=source.group_openid, **payload
+                )
+            elif getattr(getattr(source, "author", None), "user_openid", None):
+                await event.post_c2c_message(
+                    openid=source.author.user_openid, **payload
+                )
+            else:
+                return False
+        except Exception as exc:
+            if "不允许发送原生 markdown" not in str(exc):
+                raise
+            logger.warning("官 Q 不允许发送分类 Markdown，改用普通图文。")
+            await event.send(fallback)
+        return True
+
     async def category_result(self, event, slug, name):
         try:
             hot, recent = await asyncio.gather(
                 self.discussions(tag=slug, sort="-commentCount", limit=10),
                 self.discussions(tag=slug, sort="-createdAt", limit=10),
             )
-            return await self.query_results(event, await self.category_chain(name, hot, recent))
+            markdown, fallback = await self.category_delivery_chains(name, hot, recent)
+            if event.get_platform_name() in {"qq_official", "qq_official_webhook"}:
+                if await self.send_qq_category(event, markdown, fallback):
+                    return []
+            return await self.query_results(event, markdown or fallback)
         except Exception as exc:
             return [event.plain_result(f"查询论坛失败：{exc}")]
 
@@ -1106,7 +1303,7 @@ class AicueForumPlugin(Star):
 
     @filter.command("resource_analysis", alias={"资源分析", "资源分享"})
     async def resource_analysis(self, event: AstrMessageEvent):
-        for result in await self.category_result(event, "resource-share", "资源分析"):
+        for result in await self.category_result(event, "resource-share", "资源分享"):
             yield result
 
     @filter.command("off_topic", alias={"灌水区"})
