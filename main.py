@@ -79,7 +79,12 @@ def iso_time(value: str):
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
-@register("astrbot_plugin_aicue_forum", "mmxd", "言灵工坊中转站帖子监控与查询", "1.5.1")
+class MarkdownPlain(Comp.Plain):
+    def toDict(self):
+        return {"type": "markdown", "data": {"content": self.text}}
+
+
+@register("astrbot_plugin_aicue_forum", "mmxd", "言灵工坊中转站帖子监控与查询", "1.5.2")
 class AicueForumPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig = None):
         super().__init__(context)
@@ -306,13 +311,14 @@ class AicueForumPlugin(Star):
             logger.warning("生成帖子截图失败，改用普通文本消息: %s", exc)
             return self.text_chain(post, with_images=False)
 
-    def markdown_lines(self, rows, limit=10):
+    def markdown_lines(self, rows, limit=10, with_author=True):
         lines = []
         for row in rows[:limit]:
             attrs = row["attributes"]
             name = attrs["title"].replace("[", "\\[").replace("]", "\\]")
             author = attrs.get("author", "未知用户")
-            lines.append(f"[{name}]({self.base}/d/{attrs['slug']})---{author}")
+            suffix = f"---{author}" if with_author else ""
+            lines.append(f"[{name} ↗]({self.base}/d/{attrs['slug']}){suffix}")
         return lines
 
     def advertisement_directory(self):
@@ -334,31 +340,31 @@ class AicueForumPlugin(Star):
     def markdown_chain(self, rows):
         limit = self.cfg_int("search_result_count", 5, minimum=1, maximum=20)
         image = self.advertisement_image()
-        parts = ([image] if image else []) + [Comp.Plain("\n" + "\n".join(self.markdown_lines(rows, limit)))]
+        parts = ([image] if image else []) + [MarkdownPlain("\n" + "\n".join(self.markdown_lines(rows, limit, False)))]
         chain = MessageChain(parts)
         chain.use_markdown_ = True
         return chain
 
     def category_chain(self, name, hot, recent):
-        parts = [Comp.Plain(f"{name}最火帖子：\n")]
+        parts = []
         image = self.advertisement_image()
         if image:
             parts.append(image)
-        parts.append(Comp.Plain("\n" + ("\n".join(self.markdown_lines(hot)) or "暂无帖子") + f"\n\n{name}最近帖子：\n"))
+        parts.append(MarkdownPlain(f"{name}最火帖子：\n" + ("\n".join(self.markdown_lines(hot, with_author=False)) or "暂无帖子")))
         image = self.advertisement_image()
         if image:
             parts.append(image)
-        parts.append(Comp.Plain("\n" + ("\n".join(self.markdown_lines(recent)) or "暂无帖子")))
+        parts.append(MarkdownPlain(f"{name}最近帖子：\n" + ("\n".join(self.markdown_lines(recent, with_author=False)) or "暂无帖子")))
         chain = MessageChain(parts)
         chain.use_markdown_ = True
         return chain
 
     def announcement_chain(self, rows):
-        parts = [Comp.Plain("公告：\n")]
+        parts = []
         image = self.advertisement_image()
         if image:
             parts.append(image)
-        parts.append(Comp.Plain("\n" + ("\n".join(self.markdown_lines(rows, len(rows))) or "暂无公告")))
+        parts.append(MarkdownPlain("公告：\n" + ("\n".join(self.markdown_lines(rows, len(rows), False)) or "暂无公告")))
         chain = MessageChain(parts)
         chain.use_markdown_ = True
         return chain
@@ -559,6 +565,11 @@ class AicueForumPlugin(Star):
             logger.info("言灵工坊论坛账号登录成功")
         except Exception as exc:
             logger.warning("言灵工坊论坛账号登录失败，自动回帖暂不可用: %s", exc)
+        # 恢复之前保存的推送目标会话场景，避免重启后推送失效
+        targets = await self.targets()
+        for target in targets:
+            await self.prepare_qq_target(target)
+
         if self.task is None:
             self.task = asyncio.create_task(self.monitor())
 
@@ -910,17 +921,27 @@ class AicueForumPlugin(Star):
             except Exception as exc:
                 logger.warning("读取帖子 %s 详情失败: %s", row["id"], exc)
 
+    async def query_results(self, event, chain):
+        if event.get_platform_name() not in {"qq_official", "qq_official_webhook"}:
+            result = event.chain_result(chain.chain)
+            result.use_markdown_ = True
+            return [result]
+        results = []
+        for part in chain.chain:
+            result = event.chain_result([part])
+            result.use_markdown_ = isinstance(part, MarkdownPlain)
+            results.append(result)
+        return results
+
     async def category_result(self, event, slug, name):
         try:
             hot, recent = await asyncio.gather(
                 self.discussions(tag=slug, sort="-commentCount", limit=10),
                 self.discussions(tag=slug, sort="-createdAt", limit=10),
             )
-            result = event.chain_result(self.category_chain(name, hot, recent).chain)
-            result.use_markdown_ = True
-            return result
+            return await self.query_results(event, self.category_chain(name, hot, recent))
         except Exception as exc:
-            return event.plain_result(f"查询论坛失败：{exc}")
+            return [event.plain_result(f"查询论坛失败：{exc}")]
 
     async def all_announcements(self):
         rows = []
@@ -935,39 +956,45 @@ class AicueForumPlugin(Star):
     @filter.command("announcements", alias={"公告"})
     async def announcements(self, event: AstrMessageEvent):
         try:
-            result = event.chain_result(self.announcement_chain(await self.all_announcements()).chain)
-            result.use_markdown_ = True
-            yield result
+            for result in await self.query_results(event, self.announcement_chain(await self.all_announcements())):
+                yield result
         except Exception as exc:
             yield event.plain_result(f"查询论坛失败：{exc}")
 
     @filter.command("transit", alias={"中转站"})
     async def transit(self, event: AstrMessageEvent):
-        yield await self.category_result(event, "transit", "中转站")
+        for result in await self.category_result(event, "transit", "中转站"):
+            yield result
 
     @filter.command("register_bot", alias={"注册器", "注册机"})
     async def register_bot(self, event: AstrMessageEvent):
-        yield await self.category_result(event, "register-bot", "注册器")
+        for result in await self.category_result(event, "register-bot", "注册器"):
+            yield result
 
     @filter.command("jailbreak_prompts", alias={"破甲词"})
     async def jailbreak_prompts(self, event: AstrMessageEvent):
-        yield await self.category_result(event, "jailbreak-prompts", "破甲词")
+        for result in await self.category_result(event, "jailbreak-prompts", "破甲词"):
+            yield result
 
     @filter.command("latest_news", alias={"最新资讯"})
     async def latest_news(self, event: AstrMessageEvent):
-        yield await self.category_result(event, "latest-news", "最新资讯")
+        for result in await self.category_result(event, "latest-news", "最新资讯"):
+            yield result
 
     @filter.command("tech_discussion", alias={"技术讨论"})
     async def tech_discussion(self, event: AstrMessageEvent):
-        yield await self.category_result(event, "tech-discussion", "技术讨论")
+        for result in await self.category_result(event, "tech-discussion", "技术讨论"):
+            yield result
 
     @filter.command("resource_analysis", alias={"资源分析", "资源分享"})
     async def resource_analysis(self, event: AstrMessageEvent):
-        yield await self.category_result(event, "resource-share\t", "资源分析")
+        for result in await self.category_result(event, "resource-share\t", "资源分析"):
+            yield result
 
     @filter.command("off_topic", alias={"灌水区"})
     async def off_topic(self, event: AstrMessageEvent):
-        yield await self.category_result(event, "off-topic", "灌水区")
+        for result in await self.category_result(event, "off-topic", "灌水区"):
+            yield result
 
     @filter.command("recent_posts", alias={"最近帖子"})
     async def recent_posts(self, event: AstrMessageEvent):
@@ -977,9 +1004,8 @@ class AicueForumPlugin(Star):
             if not rows:
                 yield event.plain_result("三天内暂无新发布的帖子。")
                 return
-            result = event.chain_result(self.markdown_chain(rows).chain)
-            result.use_markdown_ = True
-            yield result
+            for result in await self.query_results(event, self.markdown_chain(rows)):
+                yield result
         except Exception as exc:
             yield event.plain_result(f"查询论坛失败：{exc}")
 
@@ -990,9 +1016,8 @@ class AicueForumPlugin(Star):
             if not rows:
                 yield event.plain_result("暂无监控标签热门帖子。")
                 return
-            result = event.chain_result(self.markdown_chain(rows).chain)
-            result.use_markdown_ = True
-            yield result
+            for result in await self.query_results(event, self.markdown_chain(rows)):
+                yield result
         except Exception as exc:
             yield event.plain_result(f"查询论坛失败：{exc}")
 
