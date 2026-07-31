@@ -1,13 +1,133 @@
 {
-  "forum_url": {"description": "论坛地址", "type": "string", "default": "https://flarum.aicue.top", "hint": "一般无需修改。"},
-  "forum_username": {"description": "论坛用户名或邮箱", "type": "string", "default": "", "hint": "用于登录论坛并以本人账号自动回帖。建议填写论坛用户名。"},
-  "forum_password": {"description": "论坛密码", "type": "string", "default": "", "obvious_hint": true, "hint": "敏感信息，会以明文保存在 AstrBot 配置文件中；登录 Cookie 仅在运行内存中维护。请保护配置文件权限。"},
-  "tag_slug": {"description": "监控标签（支持多个）", "type": "string", "default": "transit", "hint": "多个标签用 | 分隔，可直接填写中文，例如 中转站|注册器；也支持 transit|register-bot。可选：公告、中转站、注册器、破甲词、最新资讯、技术讨论、资源分析、灌水区。"},
-  "check_interval_seconds": {"description": "检查间隔（秒）", "type": "int", "default": 120, "hint": "最低按 30 秒执行。"},
-  "screenshot_cache_hours": {"description": "帖子截图缓存时间（小时）", "type": "int", "default": 24, "hint": "自动监控生成的帖子截图超过该时长后删除，最低 1 小时。"},
-  "reply_text": {"description": "推送成功后的论坛回复", "type": "string", "default": "已推送至群中"},
-  "excerpt_length": {"description": "正文摘要最大字数", "type": "int", "default": 500},
-  "max_images": {"description": "每帖最多推送图片数", "type": "int", "default": 3},
-  "search_result_count": {"description": "最近帖子返回数量", "type": "int", "default": 5},
-  "qq_daily_push_limit": {"description": "官 Q 每日自动推送上限", "type": "int", "default": 1000, "hint": "只限制 QQ 官方 API 平台；超额帖子进入 /最新帖子 待发列表，其他平台不受影响。"}
+  "forum_url": {
+    "description": "论坛地址",
+    "type": "string",
+    "default": "https://www.aicue.top",
+    "hint": "改这里才生效：代码里的默认值会被本项覆盖。国内服务器请填 www.aicue.top（国内线路），flarum.aicue.top 走德国机房，容易超时。"
+  },
+  "forum_username": {
+    "description": "论坛用户名或邮箱",
+    "type": "string",
+    "default": "",
+    "hint": "用于登录论坛并以本人账号自动回帖。建议填写论坛用户名。"
+  },
+  "forum_password": {
+    "description": "论坛密码",
+    "type": "string",
+    "default": "",
+    "obvious_hint": true,
+    "hint": "敏感信息，会以明文保存在 AstrBot 配置文件中；登录 Cookie 仅在运行内存中维护。请保护配置文件权限。"
+  },
+  "tag_slug": {
+    "description": "监控标签（支持多个）",
+    "type": "string",
+    "default": "transit",
+    "hint": "多个标签用 | 分隔，可直接填写中文，例如 中转站|注册器；也支持 transit|register-bot。可选：公告、中转站、注册器、破甲词、最新资讯、技术讨论、资源分析、灌水区。"
+  },
+  "check_interval_seconds": {
+    "description": "检查间隔（秒）",
+    "type": "int",
+    "default": 120,
+    "hint": "最低按 30 秒执行。"
+  },
+  "http_timeout_seconds": {
+    "description": "论坛接口超时（秒）",
+    "type": "int",
+    "default": 20,
+    "hint": "5~120。日志出现「请求超时」时说明论坛地址不通或出网拥塞，调大只是缓解，应优先换成国内线路。"
+  },
+  "reply_text": {
+    "description": "推送成功后的论坛回复",
+    "type": "string",
+    "default": "已推送至群中"
+  },
+  "reply_retry_batch": {
+    "description": "每轮自动回帖重试数量",
+    "type": "int",
+    "default": 3,
+    "hint": "一次超时要占 20 秒，数量过大会把整轮监控拖过检查间隔。"
+  },
+  "reply_retry_max": {
+    "description": "自动回帖最大重试次数",
+    "type": "int",
+    "default": 5,
+    "hint": "同一帖连续失败达该次数后放弃，避免日志被无限重试刷屏。"
+  },
+  "push_retry_max": {
+    "description": "推送最大重试轮数",
+    "type": "int",
+    "default": 20,
+    "hint": "同一帖推给同一个群连续失败达该轮数后放弃，避免坏目标每轮重复截图占带宽。"
+  },
+  "max_posts_per_push": {
+    "description": "每群每轮最多推送帖数",
+    "type": "int",
+    "default": 5,
+    "hint": "积压较多时分批推送，避免一次性发出大量截图占满带宽。剩余帖子下一轮继续。"
+  },
+  "qq_daily_push_limit": {
+    "description": "官 Q 每日自动推送上限",
+    "type": "int",
+    "default": 1000,
+    "hint": "按「帖子 × 群」计数，与 QQ 主动消息的实际扣费口径一致。超额帖子不标记已推送，次日额度恢复后自动补推；剩余额度见 /推送状态。"
+  },
+  "screenshot_max_height": {
+    "description": "帖子截图最大高度（像素）",
+    "type": "int",
+    "default": 1400,
+    "hint": "超长帖子会被截断到该高度，控制图片体积。最低 400。"
+  },
+  "screenshot_quality": {
+    "description": "帖子截图 JPEG 质量",
+    "type": "int",
+    "default": 50,
+    "hint": "30~95。50 已足够看清帖子正文，单图约 30~60 KB；带宽宽裕可上调到 70。"
+  },
+  "shot_service_url": {
+    "description": "远端截图服务地址",
+    "type": "string",
+    "default": "",
+    "hint": "填了就把截图交给远端（浏览器与图床同机），本机只收一段 JSON，最省带宽，例如 http://截图服务器IP:8899。留空则本机截图。远端需运行仓库里的 shotd.py，部署步骤见 README 的「截图与图床」一节。"
+  },
+  "shot_service_token": {
+    "description": "远端截图服务 Token",
+    "type": "string",
+    "default": "",
+    "hint": "与远端 shotd.py 的 SHOT_TOKEN 一致，不填服务端会拒绝。建议用一串长随机字符。"
+  },
+  "shot_service_timeout": {
+    "description": "远端截图超时（秒）",
+    "type": "int",
+    "default": 90,
+    "hint": "20~300。远端要开页面、等渲染、写盘，比普通接口慢很多。"
+  },
+  "image_host_base": {
+    "description": "图片公网访问地址",
+    "type": "string",
+    "default": "http://zzu2.wch1.top:44788",
+    "hint": "文件服务的对外地址，末尾不带斜杠。截图会拼成 该地址/文件名 发给 QQ。"
+  },
+  "image_host_dir": {
+    "description": "图片落盘目录",
+    "type": "string",
+    "default": "/AstrBot/data/imgs",
+    "hint": "容器内路径，需与文件服务（Caddy）挂载的目录一致。"
+  },
+  "image_keep_days": {
+    "description": "公网图片保留天数",
+    "type": "int",
+    "default": 3,
+    "hint": "超过该天数的截图文件自动删除，避免磁盘堆积。"
+  },
+  "search_result_count": {
+    "description": "最近帖子返回数量",
+    "type": "int",
+    "default": 5
+  },
+  "ad_image_url": {
+    "description": "广告图 URL（直接填入图床或 GitHub 上的图片链接）",
+    "type": "string",
+    "default": "",
+    "hint": "用于分类查询等场景的广告横幅图片。留空则使用默认图片。支持 imgbb、GitHub、sm.ms 等任意公网图片链接。"
+  }
 }

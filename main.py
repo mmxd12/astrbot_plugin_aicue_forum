@@ -1,10 +1,8 @@
 import asyncio
-import base64
+import hashlib
 import html
 import re
 import random
-import secrets
-import shutil
 from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
 from pathlib import Path
@@ -13,11 +11,13 @@ from urllib.parse import urlencode, urljoin
 import aiohttp
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
-from astrbot.api.star import Context, Star, StarTools, register
+from astrbot.api.star import Context, Star, register
 import astrbot.api.message_components as Comp
 from botpy.types.message import MarkdownPayload
 
 BASE_DEFAULT = "https://www.aicue.top"
+IMAGE_HOST_BASE = "http://zzu2.wch1.top:44788"
+IMAGE_HOST_DIR = "/AstrBot/data/imgs"
 TAG_NAMES = {
     "announcements": "公告",
     "transit": "中转站",
@@ -78,46 +78,35 @@ def parse_content(content_html: str, base: str):
     return parser.result()
 
 
+def md_size(shot, width=900):
+    """QQ Markdown 图片必须声明尺寸，按真实截图比例折算，否则图片会被压扁。"""
+    _, real_width, real_height = shot
+    height = max(1, round(real_height * width / max(1, real_width)))
+    return f"#{width}px #{height}px"
+
+
+def err(exc):
+    """aiohttp 超时等异常 str() 为空，日志会变成「失败: 」，故补上类型名。"""
+    text = str(exc).strip()
+    name = type(exc).__name__
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+        return f"请求超时（{name}），论坛地址不通或网络拥塞"
+    return f"{name}: {text}" if text else name
+
+
 def iso_time(value: str):
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
-def crop_rendered_image(content: bytes, padding=16):
-    """裁掉渲染服务固定画布产生的空白，识别失败时返回原图。"""
-    try:
-        from io import BytesIO
-        from PIL import Image, ImageChops
-
-        with Image.open(BytesIO(content)) as source:
-            image = source.convert("RGB")
-        background = Image.new("RGB", image.size, image.getpixel((0, 0)))
-        difference = ImageChops.difference(image, background).convert("L")
-        bbox = difference.point(lambda value: 255 if value > 10 else 0).getbbox()
-        if not bbox:
-            return content
-        left, top, right, bottom = bbox
-        box = (
-            max(0, left - padding),
-            max(0, top - padding),
-            min(image.width, right + padding),
-            min(image.height, bottom + padding),
-        )
-        if box == (0, 0, image.width, image.height):
-            return content
-        output = BytesIO()
-        image.crop(box).save(output, "JPEG", quality=85, optimize=True)
-        return output.getvalue()
-    except Exception as exc:
-        logger.warning("裁剪帖子截图失败，保留原图: %s", exc)
-        return content
-
-
 class MarkdownPlain(Comp.Plain):
+    """官 Q 走原生 Markdown。OneBot 协议没有 markdown 段类型，
+    落回 text 段，否则 NapCat 之类会直接拒收整条消息。"""
+
     def toDict(self):
-        return {"type": "markdown", "data": {"content": self.text}}
+        return {"type": "text", "data": {"text": self.text}}
 
 
-@register("astrbot_plugin_aicue_forum", "mmxd", "言灵工坊中转站帖子监控与查询", "1.5.9")
+@register("astrbot_plugin_aicue_forum", "mmxd", "言灵工坊中转站帖子监控与查询", "1.5.23")
 class AicueForumPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig = None):
         super().__init__(context)
@@ -131,29 +120,16 @@ class AicueForumPlugin(Star):
         self.auth_generation = 0
         self.auth_lock = asyncio.Lock()
         self.check_lock = asyncio.Lock()
-        self.pending_ad_uploads = {}
-        self.data_directory = StarTools.get_data_dir("astrbot_plugin_aicue_forum")
-        self.migrate_legacy_data()
-        self.advertisement_directory().mkdir(parents=True, exist_ok=True)
-        migration = self.advertisement_directory() / ".initialized"
-        bundled_ad = Path(__file__).parent / "assets" / "forum_header.png"
-        if not migration.exists():
-            if not self.advertisement_files() and bundled_ad.exists():
-                (self.advertisement_directory() / "forum_header.png").write_bytes(bundled_ad.read_bytes())
-            migration.touch()
+        self.ensure_monitor()
 
-    def migrate_legacy_data(self):
-        legacy = Path(__file__).parent / "data"
-        for name in ("advertisements", "screenshots"):
-            source = legacy / name
-            target = self.data_directory / name
-            if not source.is_dir():
-                continue
-            target.mkdir(parents=True, exist_ok=True)
-            for path in source.iterdir():
-                destination = target / path.name
-                if path.is_file() and not destination.exists():
-                    shutil.copy2(path, destination)
+    def ensure_monitor(self):
+        """插件热重载时 on_astrbot_loaded 不会再触发，这里兜底拉起监控循环。"""
+        if self.task is not None and not self.task.done():
+            return
+        try:
+            self.task = asyncio.get_running_loop().create_task(self.monitor())
+        except RuntimeError:
+            self.task = None
 
     def cfg(self, key, default=None):
         return self.config.get(key, default)
@@ -180,7 +156,7 @@ class AicueForumPlugin(Star):
 
     async def client(self):
         if self.http is None or self.http.closed:
-            self.http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20))
+            self.http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=self.cfg_int("http_timeout_seconds", 20, minimum=5, maximum=120)))
             self.csrf_token = ""
             self.authenticated = False
             self.forum_user_id = ""
@@ -273,89 +249,116 @@ class AicueForumPlugin(Star):
         user = next((x for x in included if x["type"] == "users" and x["id"] == user_id), None)
         attrs = discussion["attributes"]
         content, images = parse_content(first["attributes"].get("contentHtml", "") if first else "", self.base)
+        tag_refs = discussion.get("relationships", {}).get("tags", {}).get("data", [])
+        tag_name = ""
+        if tag_refs:
+            first_tag = tag_refs[0]
+            tag = next((x for x in included if x["type"] == "tags" and x["id"] == first_tag.get("id")), None)
+            if tag:
+                tag_name = tag.get("attributes", {}).get("name", "")
         return {
             "id": discussion["id"], "title": attrs["title"], "created": attrs["createdAt"],
             "comments": attrs.get("commentCount", 0), "author": (user or {}).get("attributes", {}).get("displayName", "未知用户"),
-            "content": content, "images": images, "url": f"{self.base}/d/{attrs['slug']}"
+            "content": content, "images": images, "url": f"{self.base}/d/{attrs['slug']}",
+            "tag": tag_name
         }
 
-    def text_chain(self, post, prefix="论坛新帖", with_images=True):
-        local_time = iso_time(post["created"]).astimezone(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M")
-        excerpt = post["content"][:self.cfg_int("excerpt_length", 500, maximum=5000)]
-        if len(post["content"]) > len(excerpt):
-            excerpt += "……"
-        text = f"【{prefix}】\n{post['title']}\n作者：{post['author']}  发布时间：{local_time}\n"
-        if excerpt:
-            text += f"\n{excerpt}\n"
-        text += f"\n{post['author']} - {post['url']}"
-        parts = [Comp.Plain(text)]
-        if with_images:
-            for image in post["images"][:self.cfg_int("max_images", 3, maximum=10)]:
-                parts.append(Comp.Image.fromURL(image))
-        return MessageChain(parts)
-
-    async def post_chain(self, post, cache_path=None, return_public_url=False):
-        local_time = iso_time(post["created"]).astimezone(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M")
-        excerpt = post["content"][:self.cfg_int("excerpt_length", 500, maximum=5000)]
-        if len(post["content"]) > len(excerpt):
-            excerpt += "……"
-        try:
-            image_url = await self.html_render(
-                """<style>html,body{margin:0;padding:0}</style>
-                <div style="width:960px;height:400px;overflow:hidden;background:white;font-family:'Microsoft YaHei',sans-serif;color:#24384a">
-                <div style="background:#2875b5;color:white;padding:18px 28px;font-size:27px;font-weight:600">言灵工坊 · 中转站</div>
-                <div style="background:#20a4b7;color:white;padding:38px 34px;font-size:31px;text-align:center">{{ title | e }}</div>
-                <div style="background:white;padding:34px;font-size:22px;line-height:1.75">
-                  <div style="color:#526c80;margin-bottom:20px">{{ author | e }}　{{ created | e }}</div>
-                  <div style="white-space:pre-wrap">{{ content | e }}</div>
-                </div></div>""",
-                {
-                    "title": str(post["title"]),
-                    "author": str(post["author"]),
-                    "created": local_time,
-                    "content": excerpt or "（暂无正文）",
-                },
-                return_url=True,
-                options={
-                    "type": "jpeg",
-                    "quality": 80,
-                    "full_page": True,
-                    "clip": {"x": 0, "y": 0, "width": 960, "height": 400},
-                },
+    def image_base(self):
+        """只洗掉空白和引号。开头带 # 视为「本机图床已停用」，直接报错让本轮降级为纯文字。"""
+        raw = str(self.cfg("image_host_base", IMAGE_HOST_BASE)).strip().strip("'\"").strip()
+        base = raw.rstrip("/")
+        if not base.startswith(("http://", "https://")):
+            hint = "（开头的 # 号是注释掉的意思吗？删掉它才会启用本机图床）" if base.startswith("#") else ""
+            raise RuntimeError(
+                f"image_host_base 配置无效，应以 http:// 或 https:// 开头，当前为 {raw!r}{hint}"
             )
-            if not str(image_url).startswith(("http://", "https://")):
-                raise RuntimeError("截图服务未返回图片 URL")
-            if return_public_url:
-                return str(image_url)
-            session = await self.client()
-            async with session.get(image_url) as resp:
-                if resp.status >= 400:
-                    raise RuntimeError(f"下载截图失败（HTTP {resp.status}）")
-                content_type = resp.headers.get("Content-Type", "").lower()
-                if not content_type.startswith("image/"):
-                    raise RuntimeError(f"截图响应类型异常：{content_type or '未知'}")
-                max_bytes = 10 * 1024 * 1024
-                if resp.content_length and resp.content_length > max_bytes:
-                    raise RuntimeError("截图超过 10 MiB")
-                image_bytes = await resp.content.read(max_bytes + 1)
-                if not image_bytes or len(image_bytes) > max_bytes:
-                    raise RuntimeError("截图为空或超过 10 MiB")
-            image_bytes = await asyncio.to_thread(crop_rendered_image, image_bytes)
-            if cache_path:
-                cache_path = Path(cache_path)
-                cache_path.parent.mkdir(parents=True, exist_ok=True)
-                temporary = cache_path.with_suffix(".tmp")
-                await asyncio.to_thread(temporary.write_bytes, image_bytes)
-                await asyncio.to_thread(temporary.replace, cache_path)
-                image = Comp.Image.fromFileSystem(cache_path)
-            else:
-                image = Comp.Image.fromBytes(image_bytes)
-            return MessageChain([image, Comp.Plain(f"\n{post['author']} - {post['url']}")])
-        except Exception as exc:
-            if return_public_url:
-                raise
-            logger.warning("生成帖子截图失败，改用普通文本消息: %s", exc)
-            return self.text_chain(post, with_images=False)
+        return base
+
+    async def publish_image(self, image_bytes: bytes) -> str:
+        """写入本地文件服务目录，返回公网 URL"""
+        base = self.image_base()
+        directory = Path(str(self.cfg("image_host_dir", IMAGE_HOST_DIR)))
+        await asyncio.to_thread(directory.mkdir, parents=True, exist_ok=True)
+        name = hashlib.sha1(image_bytes).hexdigest()[:16] + ".jpg"
+        path = directory / name
+        if not path.exists():
+            temporary = path.with_suffix(".tmp")
+            await asyncio.to_thread(temporary.write_bytes, image_bytes)
+            await asyncio.to_thread(temporary.replace, path)
+        return f"{base}/{name}"
+
+    async def screenshot_post(self, url: str):
+        """截取帖子网页，返回 (JPEG 字节, 宽, 高)。"""
+        try:
+            from playwright.async_api import async_playwright
+        except ImportError as exc:
+            raise RuntimeError("未安装 Playwright，请执行 pip install playwright") from exc
+
+        async with async_playwright() as playwright:
+            try:
+                browser = await playwright.chromium.launch(
+                    headless=True,
+                    args=["--no-sandbox", "--disable-setuid-sandbox"]
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    "启动 Chromium 失败，pip install playwright 只装了库、没装浏览器内核。"
+                    "请在容器内执行 python -m playwright install --with-deps chromium，"
+                    f"或改用远端截图服务 shot_service_url：{err(exc)}"
+                ) from exc
+            try:
+                page = await browser.new_page(
+                    viewport={"width": 1280, "height": 900},
+                    device_scale_factor=1,
+                )
+                await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                # 等帖子正文真正渲染出来，而不是傻等固定秒数；等不到再退回固定等待
+                try:
+                    await page.wait_for_selector(".Post-body", timeout=15000)
+                    await page.wait_for_load_state("networkidle", timeout=8000)
+                except Exception as exc:
+                    logger.debug("帖子正文未等到，退回固定等待: %s", err(exc))
+                    await page.wait_for_timeout(3000)
+                limit = self.cfg_int("screenshot_max_height", 1400, minimum=400)
+                try:
+                    height = int(await page.evaluate("document.body.scrollHeight") or limit)
+                except Exception:
+                    height = limit
+                height = max(400, min(height, limit))
+                await page.set_viewport_size({"width": 1280, "height": height})
+                await page.wait_for_timeout(300)
+                image_bytes = await page.screenshot(
+                    type="jpeg",
+                    quality=self.cfg_int("screenshot_quality", 70, minimum=30, maximum=95),
+                )
+                return image_bytes, 1280, height
+            finally:
+                await browser.close()
+
+    async def post_image_url(self, url):
+        """返回 (公网 URL, 宽, 高)。配了远端截图服务就走远端，否则本机截图 + 本机落盘。"""
+        service = str(self.cfg("shot_service_url", "")).strip()
+        if service:
+            return await self.remote_shot(url, service)
+        image_bytes, width, height = await self.screenshot_post(url)
+        return await self.publish_image(image_bytes), width, height
+
+    async def remote_shot(self, url, service):
+        """截图服务与图床同机，图片不经过本机带宽，只回传一段 JSON。"""
+        session = await self.client()
+        # 截图比接口慢得多，不能套用 http_timeout_seconds
+        timeout = aiohttp.ClientTimeout(total=self.cfg_int("shot_service_timeout", 90, minimum=20, maximum=300))
+        headers = {"X-Token": str(self.cfg("shot_service_token", ""))}
+        async with session.post(
+            service.rstrip("/") + "/shot", json={"url": url}, headers=headers, timeout=timeout
+        ) as resp:
+            if resp.status >= 400:
+                raise RuntimeError(f"截图服务返回 HTTP {resp.status}: {(await resp.text())[:200]}")
+            data = await resp.json(content_type=None)
+        image_url = str((data or {}).get("url", "")).strip()
+        if not image_url.startswith(("http://", "https://")):
+            raise RuntimeError(f"截图服务未返回有效图片地址: {str(data)[:200]}")
+        return image_url, int(data.get("width") or 1280), int(data.get("height") or 900)
 
     def markdown_lines(self, rows, limit=10, with_author=True):
         lines = []
@@ -367,48 +370,24 @@ class AicueForumPlugin(Star):
             lines.append(f"[{name} ↗]({self.base}/d/{attrs['slug']}){suffix}")
         return lines
 
-    def advertisement_directory(self):
-        return self.data_directory / "advertisements"
+    def ad_image(self):
+        """从配置直接获取广告图"""
+        url = self.cfg("ad_image_url", "")
+        if url:
+            return Comp.Image.fromURL(url)
+        return None
 
-    def advertisement_files(self):
-        directory = self.advertisement_directory()
-        if not directory.exists():
-            return []
-        extensions = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
-        return sorted(path for path in directory.iterdir() if path.is_file() and path.suffix.lower() in extensions)
-
-    def advertisement_image(self):
-        files = self.advertisement_files()
-        if not files:
-            return None
-        return Comp.Image.fromFileSystem(secrets.choice(files))
-
-    async def advertisement_public_url(self):
-        files = self.advertisement_files()
-        path = secrets.choice(files) if files else Path(__file__).parent / "assets" / "forum_header.png"
-        suffix = path.suffix.lower()
-        mime = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".gif": "image/gif", ".webp": "image/webp"}.get(suffix, "image/png")
-        content = await asyncio.to_thread(path.read_bytes)
-        data_url = f"data:{mime};base64,{base64.b64encode(content).decode()}"
-        width, height = 1280, 720
-        image_url = await self.html_render(
-            """<style>*{box-sizing:border-box}html,body{margin:0;width:1280px;height:720px;overflow:hidden;background:#111}</style>
-            <div style="position:relative;width:1280px;height:720px;overflow:hidden">
-              <img src="{{ image }}" style="position:absolute;inset:-32px;width:1344px;height:784px;object-fit:cover;filter:blur(24px);opacity:.72">
-              <img src="{{ image }}" style="position:absolute;inset:0;width:100%;height:100%;object-fit:contain">
-            </div>""",
-            {"image": data_url},
-            return_url=True,
-            options={"type": "jpeg", "quality": 85, "full_page": True},
-        )
-        if not str(image_url).startswith(("http://", "https://")):
-            raise RuntimeError("T2I 未返回公网图片 URL")
-        return str(image_url), width, height
+    def ad_image_url(self):
+        """直接返回配置的广告图 URL"""
+        url = self.cfg("ad_image_url", "")
+        if url:
+            return url, 2580, 1342
+        return None, 2580, 1342
 
     def fallback_query_chain(self, texts):
         parts = []
         for text in texts:
-            image = self.advertisement_image()
+            image = self.ad_image()
             if image:
                 parts.append(image)
             parts.append(MarkdownPlain(text))
@@ -418,121 +397,48 @@ class AicueForumPlugin(Star):
 
     async def public_query_chain(self, texts):
         try:
-            images = await asyncio.gather(*(self.advertisement_public_url() for _ in texts))
-            content = "\n\n".join(
-                f"![论坛图片 #{width}px #{height}px]({url})\n\n{text}"
-                for (url, width, height), text in zip(images, texts)
-            )
-            chain = MessageChain([MarkdownPlain(content)])
-            chain.use_markdown_ = True
-            return chain
+            image_url, width, height = self.ad_image_url()
+            if str(image_url).startswith(("http://", "https://")):
+                content = "\n\n".join(
+                    f"![论坛图片 #{width}px #{height}px]({image_url})\n\n{text}"
+                    for text in texts
+                )
+                chain = MessageChain([MarkdownPlain(content)])
+                chain.use_markdown_ = True
+                return chain
         except Exception as exc:
-            logger.warning("生成查询公网图片失败，降级为先发图片再发 Markdown: %s", exc)
-            return self.fallback_query_chain(texts)
+            logger.warning("生成查询公网图片失败，降级为先发图片再发 Markdown: %s", err(exc))
+        return self.fallback_query_chain(texts)
 
     async def markdown_chain(self, rows):
         limit = self.cfg_int("search_result_count", 5, minimum=1, maximum=20)
         text = "\n".join(self.markdown_lines(rows, limit, True))
         return await self.public_query_chain([text])
 
-    async def category_chain(self, name, hot, recent):
-        return await self.public_query_chain([
-            f"{name}最火帖子：\n" + ("\n".join(self.markdown_lines(hot, with_author=True)) or "暂无帖子"),
-            f"{name}最近帖子：\n" + ("\n".join(self.markdown_lines(recent, with_author=True)) or "暂无帖子"),
-        ])
-
     async def announcement_chain(self, rows):
         text = "公告：\n" + ("\n".join(self.markdown_lines(rows, len(rows), True)) or "暂无公告")
         return await self.public_query_chain([text])
 
-    def screenshot_path(self, discussion_id):
-        safe_id = re.sub(r"[^A-Za-z0-9_-]", "_", str(discussion_id))
-        return self.data_directory / "screenshots" / f"{safe_id}.jpg"
-
-    def cleanup_screenshots(self):
-        directory = self.data_directory / "screenshots"
-        if not directory.exists():
+    async def cleanup_published_images(self):
+        """图多了 stat 上千次会卡住事件循环，丢进线程跑。"""
+        directory = Path(str(self.cfg("image_host_dir", IMAGE_HOST_DIR)))
+        if not directory.is_dir():
             return
-        cutoff = datetime.now().timestamp() - self.cfg_int("screenshot_cache_hours", 24, minimum=1) * 60 * 60
-        for path in directory.glob("*.jpg"):
+        cutoff = datetime.now().timestamp() - self.cfg_int("image_keep_days", 3, minimum=1) * 86400
+        await asyncio.to_thread(self._sweep_images, directory, cutoff)
+
+    @staticmethod
+    def _sweep_images(directory, cutoff):
+        # .tmp 是写盘中途崩溃留下的，不清会永久占盘
+        for path in (*directory.glob("*.jpg"), *directory.glob("*.tmp")):
             try:
                 if path.stat().st_mtime < cutoff:
                     path.unlink()
             except OSError as exc:
-                logger.warning("清理帖子截图缓存 %s 失败: %s", path, exc)
+                logger.warning("清理公网图片 %s 失败: %s", path, err(exc))
 
-    def monitor_text_chain(self, grouped):
-        lines = []
-        for tag in self.tag_slugs():
-            rows = grouped.get(tag, [])
-            if not rows:
-                continue
-            lines.append(f"{TAG_NAMES.get(tag, tag)}最新帖子：")
-            for row in rows:
-                attrs = row["attributes"]
-                lines.append(
-                    f"标题：{attrs['title']}\n"
-                    f"链接：{self.base}/d/{attrs['slug']}\n"
-                    f"作者：{attrs.get('author', '未知用户')}"
-                )
-        chain = MessageChain([Comp.Plain("\n\n".join(lines))])
-        chain.use_markdown_ = True
-        return chain
-
-    async def monitor_markdown_chain(self, grouped):
-        lines = []
-        for tag in self.tag_slugs():
-            rows = grouped.get(tag, [])
-            if not rows:
-                continue
-            lines.append(f"{TAG_NAMES.get(tag, tag)}最新帖子：")
-            for row in rows:
-                attrs = row["attributes"]
-                image_url = await self.post_chain(
-                    await self.detail(str(row["id"])), return_public_url=True
-                )
-                title = str(attrs["title"]).replace("[", "\\[").replace("]", "\\]")
-                post_url = f"{self.base}/d/{attrs['slug']}"
-                lines.append(
-                    f"![帖子截图 #960px #400px]({image_url})\n"
-                    f"[{title} ↗]({post_url})\n"
-                    f"-- {attrs.get('author', '未知用户')}"
-                )
-        chain = MessageChain([MarkdownPlain("\n\n".join(lines))])
-        chain.use_markdown_ = True
-        return chain
-
-    async def monitor_public_chain(self, grouped):
-        parts = []
-        for tag in self.tag_slugs():
-            rows = grouped.get(tag, [])
-            if not rows:
-                continue
-            if parts:
-                parts.append(Comp.Plain(chr(10) * 2))
-            parts.append(Comp.Plain(f"{TAG_NAMES.get(tag, tag)}最新帖子：" + chr(10)))
-            for row in rows:
-                attrs = row["attributes"]
-                image_url = await self.post_chain(
-                    await self.detail(str(row["id"])), return_public_url=True
-                )
-                parts.extend([
-                    Comp.Image.fromURL(image_url),
-                    Comp.Plain(
-                        chr(10).join([
-                            "",
-                            f"标题：{attrs['title']}",
-                            f"链接：{self.base}/d/{attrs['slug']}",
-                            f"作者：{attrs.get('author', '未知用户')}",
-                            "",
-                        ])
-                    ),
-                ])
-        chain = MessageChain(parts)
-        chain.use_markdown_ = False
-        return chain
-
-    async def monitor_delivery_chains(self, grouped):
+    async def monitor_delivery_chains(self, grouped, screenshots=None):
+        screenshots = screenshots if screenshots is not None else {}
         markdown_lines = []
         fallback_parts = []
         for tag in self.tag_slugs():
@@ -546,67 +452,37 @@ class AicueForumPlugin(Star):
             fallback_parts.append(Comp.Plain(heading + chr(10)))
             for row in rows:
                 attrs = row["attributes"]
-                image_url = await self.post_chain(
-                    await self.detail(str(row["id"])), return_public_url=True
-                )
-                title = str(attrs["title"]).replace("[", "\\[").replace("]", "\\]")
+                row_id = str(row["id"])
                 post_url = f"{self.base}/d/{attrs['slug']}"
+                # 同一帖对多个群只截一次图，多群推送时避免重复启浏览器、重复占带宽
+                if row_id not in screenshots:
+                    try:
+                        screenshots[row_id] = await self.post_image_url(post_url)
+                    except Exception as exc:
+                        # 截图挂了也要把帖子推出去，否则会一直卡在待重试队列里反复重截
+                        logger.warning("帖子 %s 截图失败，降级为纯文字推送: %s", row_id, err(exc))
+                        screenshots[row_id] = None
+                shot = screenshots.get(row_id)
+                title = str(attrs["title"]).replace("[", "\\[").replace("]", "\\]")
                 author = attrs.get("author", "未知用户")
-                markdown_lines.append(chr(10).join([
-                    f"![帖子截图 #960px #400px]({image_url})",
-                    f"[{title} ↗]({post_url})",
-                    f"-- {author}",
-                ]))
-                fallback_parts.extend([
-                    Comp.Image.fromURL(image_url),
-                    Comp.Plain(chr(10).join([
-                        "",
-                        f"标题：{attrs['title']}",
-                        f"链接：{post_url}",
-                        f"作者：{author}",
-                        "",
-                    ])),
-                ])
+                markdown_lines.append(chr(10).join(
+                    ([f"![帖子截图 {md_size(shot)}]({shot[0]})"] if shot else [])
+                    + [f"[{title} ↗]({post_url})", f"-- {author}"]
+                ))
+                if shot:
+                    fallback_parts.append(Comp.Image.fromURL(shot[0]))
+                fallback_parts.append(Comp.Plain(chr(10).join([
+                    "",
+                    f"标题：{attrs['title']}",
+                    f"链接：{post_url}",
+                    f"作者：{author}",
+                    "",
+                ])))
         markdown_chain = MessageChain([MarkdownPlain((chr(10) * 2).join(markdown_lines))])
         markdown_chain.use_markdown_ = True
         fallback_chain = MessageChain(fallback_parts)
         fallback_chain.use_markdown_ = False
         return markdown_chain, fallback_chain
-
-    async def monitor_chain(self, grouped, screenshots):
-        parts = []
-        for tag in self.tag_slugs():
-            rows = grouped.get(tag, [])
-            if not rows:
-                continue
-            if parts:
-                parts.append(Comp.Plain("\n\n"))
-            parts.append(Comp.Plain(f"{TAG_NAMES.get(tag, tag)}最新帖子：\n"))
-            for row in rows:
-                row_id = str(row["id"])
-                if row_id not in screenshots:
-                    try:
-                        cache_path = self.screenshot_path(row_id)
-                        if cache_path.exists():
-                            screenshots[row_id] = Comp.Image.fromFileSystem(cache_path)
-                        else:
-                            rendered = await self.post_chain(await self.detail(row_id), cache_path)
-                            screenshots[row_id] = next(part for part in rendered.chain if isinstance(part, Comp.Image))
-                    except Exception as exc:
-                        logger.warning("帖子 %s 页面截图失败，改用广告图库图片: %s", row_id, exc)
-                        screenshots[row_id] = self.advertisement_image() or Comp.Image.fromFileSystem(Path(__file__).parent / "assets" / "forum_header.png")
-                attrs = row["attributes"]
-                parts.extend([
-                    screenshots[row_id],
-                    Comp.Plain(
-                        f"\n标题：{attrs['title']}\n"
-                        f"链接：{self.base}/d/{attrs['slug']}\n"
-                        f"作者：{attrs.get('author', '未知用户')}\n"
-                    ),
-                ])
-        chain = MessageChain(parts)
-        chain.use_markdown_ = False
-        return chain
 
     def target_platform(self, target):
         platform_id = str(target).split(":", 1)[0]
@@ -649,6 +525,7 @@ class AicueForumPlugin(Star):
         platform = self.target_platform(target)
         parts = str(target).split(":", 2)
         if not platform or len(parts) != 3 or not parts[2]:
+            logger.warning("官 Q 目标 %s 无法解析平台实例或会话 ID，跳过推送", target)
             return False
         session_id = parts[2]
         scene = getattr(platform, "_session_scene", {}).get(session_id)
@@ -657,19 +534,33 @@ class AicueForumPlugin(Star):
         content = "".join(
             part.text for part in markdown_chain.chain if isinstance(part, Comp.Plain)
         )
-        try:
-            ret = await platform.client.api.post_group_message(
-                group_openid=session_id,
-                markdown=MarkdownPayload(content=content),
-                msg_type=2,
-                msg_seq=random.randint(1, 10000),
-            )
-        except Exception as exc:
-            if "不允许发送原生 markdown" not in str(exc):
-                logger.exception("官 Q Markdown 推送失败，保留待重试：%s", target)
-                return False
-            logger.warning("官 Q 不允许发送原生 Markdown，改用普通富媒体：%s", target)
-            return await self.send_target(target, fallback_chain)
+        msg_id = getattr(platform, "_session_last_message_id", {}).get(session_id)
+        # 被动消息的 msg_id 仅 5 分钟有效，冷清群必然过期，因此先走主动消息再回退。
+        ret = None
+        last_error = None
+        for attempt_id in dict.fromkeys([None, msg_id]):
+            try:
+                ret = await platform.client.api.post_group_message(
+                    group_openid=session_id,
+                    markdown=MarkdownPayload(content=content),
+                    msg_type=2,
+                    msg_id=attempt_id,
+                    msg_seq=random.randint(1, 10000),
+                )
+                break
+            except Exception as exc:
+                last_error = exc
+                if "不允许发送原生 markdown" in str(exc):
+                    logger.warning("官 Q 不允许发送原生 Markdown，改用普通富媒体：%s", target)
+                    return await self.send_target(target, fallback_chain)
+                logger.warning(
+                    "官 Q 推送失败（%s）：%s → %s",
+                    "主动消息" if attempt_id is None else "被动消息",
+                    target, exc,
+                )
+        if ret is None:
+            logger.warning("官 Q Markdown 推送全部方式失败，保留待重试：%s（%s）", target, last_error)
+            return False
         sent_id = platform._extract_message_id(ret)
         if not sent_id:
             logger.warning("官 Q Markdown 推送未返回消息 ID，保留待重试：%s", target)
@@ -683,9 +574,11 @@ class AicueForumPlugin(Star):
             return False
         platform = self.target_platform(target)
         if not platform:
+            logger.warning("推送目标 %s 找不到平台实例（平台 ID 变更或适配器未启用），跳过", target)
             return False
         parts = str(target).split(":", 2)
         if len(parts) != 3 or not parts[2]:
+            logger.warning("推送目标 %s 格式无效，跳过", target)
             return False
         session_id = parts[2]
         qq_official = platform.meta().name in {"qq_official", "qq_official_webhook"}
@@ -700,7 +593,26 @@ class AicueForumPlugin(Star):
         logger.warning("官 Q 目标 %s 未返回新消息 ID，按发送失败保留待重试", target)
         return False
 
-    async def consume_qq_quota(self, discussion_id, commit=True):
+    def note_push_failure(self, counts, rows, target, retry_targets):
+        """同一帖对同一群连续失败超过上限就放弃，避免死帖每轮重新截图、无限占带宽。"""
+        limit = self.cfg_int("push_retry_max", 20, minimum=1)
+        for row in rows:
+            row_id = str(row["id"])
+            key = self.quota_key(row_id, target)
+            counts[key] = int(counts.get(key, 0)) + 1
+            if counts[key] < limit:
+                continue
+            counts.pop(key, None)
+            if target in retry_targets.get(row_id, []):
+                retry_targets[row_id].remove(target)
+            logger.warning("帖子 %s 推送至 %s 连续失败 %s 次，放弃该群", row_id, target, limit)
+
+    @staticmethod
+    def quota_key(discussion_id, target):
+        # QQ 按发出的消息计费，同一帖推给 N 个群就是 N 条，故按 帖子+目标 计数
+        return f"{discussion_id}@{target}"
+
+    async def consume_qq_quota(self, discussion_id, target, commit=True):
         today = datetime.now(timezone(timedelta(hours=8))).date().isoformat()
         quota = await self.get_kv_data("qq_daily_quota", {})
         if not isinstance(quota, dict) or quota.get("date") != today:
@@ -711,19 +623,20 @@ class AicueForumPlugin(Star):
             count = max(0, int(quota.get("count", 0)))
         except (TypeError, ValueError):
             count = len(used_ids)
-        discussion_id = str(discussion_id)
-        if discussion_id in used_ids:
+        key = self.quota_key(discussion_id, target)
+        if key in used_ids:
             return True
         limit = self.cfg_int("qq_daily_push_limit", 1000, minimum=1)
         if count >= limit:
+            logger.warning("官 Q 今日主动消息额度 %s 已用尽，%s 保留待明日重试", limit, key)
             return False
         if commit:
             quota["count"] = count + 1
-            quota["discussion_ids"] = [*used_ids, discussion_id]
+            quota["discussion_ids"] = [*used_ids, key]
             await self.put_kv_data("qq_daily_quota", quota)
         return True
 
-    async def qq_quota_eligible(self, rows):
+    async def qq_quota_eligible(self, rows, target):
         today = datetime.now(timezone(timedelta(hours=8))).date().isoformat()
         quota = await self.get_kv_data("qq_daily_quota", {})
         if not isinstance(quota, dict) or quota.get("date") != today:
@@ -736,30 +649,14 @@ class AicueForumPlugin(Star):
             remaining = self.cfg_int("qq_daily_push_limit", 1000, minimum=1) - len(used_ids)
         eligible = []
         for row in rows:
-            row_id = str(row["id"])
-            if row_id in used_ids:
+            key = self.quota_key(str(row["id"]), target)
+            if key in used_ids:
                 eligible.append(row)
             elif remaining > 0:
                 eligible.append(row)
-                used_ids.add(row_id)
+                used_ids.add(key)
                 remaining -= 1
         return eligible
-
-    async def add_pending(self, row):
-        pending = await self.get_kv_data("pending_latest_posts", [])
-        if not isinstance(pending, list):
-            pending = []
-        if not any(isinstance(item, dict) and str(item.get("id")) == str(row["id"]) for item in pending):
-            pending.append({"id": str(row["id"]), "attributes": row.get("attributes", {})})
-            await self.put_kv_data("pending_latest_posts", pending[-1000:])
-
-    async def remove_pending(self, discussion_id):
-        pending = await self.get_kv_data("pending_latest_posts", [])
-        if not isinstance(pending, list):
-            return
-        remaining = [x for x in pending if not isinstance(x, dict) or str(x.get("id")) != str(discussion_id)]
-        if len(remaining) != len(pending):
-            await self.put_kv_data("pending_latest_posts", remaining)
 
     async def targets(self):
         value = await self.get_kv_data("push_targets", [])
@@ -771,13 +668,32 @@ class AicueForumPlugin(Star):
         pending = await self.get_kv_data("pending_forum_replies", [])
         if not isinstance(pending, list) or not pending:
             return
-        remaining = []
-        for discussion_id in dict.fromkeys(str(x) for x in pending):
+        # 每次只重试少量，否则一个 20 秒超时 × N 帖会把整轮监控拖垮
+        batch = self.cfg_int("reply_retry_batch", 3, minimum=1, maximum=20)
+        fails = await self.get_kv_data("reply_retry_fails", {})
+        fails = fails if isinstance(fails, dict) else {}
+        limit = self.cfg_int("reply_retry_max", 5, minimum=1, maximum=50)
+        queue = list(dict.fromkeys(str(x) for x in pending))
+        remaining = queue[batch:]
+        for discussion_id in queue[:batch]:
             try:
                 await self.reply(discussion_id)
+                fails.pop(discussion_id, None)
             except Exception as exc:
+                status = getattr(exc, "status", None) if isinstance(exc, ForumAPIError) else None
+                if status in {403, 404, 410}:
+                    logger.info("帖子 %s 已删除或不可回复（HTTP %s），放弃自动回帖", discussion_id, status)
+                    fails.pop(discussion_id, None)
+                    continue
+                count = int(fails.get(discussion_id, 0)) + 1
+                if count >= limit:
+                    logger.warning("帖子 %s 自动回帖连续失败 %s 次，放弃：%s", discussion_id, count, err(exc))
+                    fails.pop(discussion_id, None)
+                    continue
+                fails[discussion_id] = count
                 remaining.append(discussion_id)
-                logger.warning("帖子 %s 自动回帖重试失败: %s", discussion_id, exc)
+                logger.warning("帖子 %s 自动回帖重试失败（第 %s 次）: %s", discussion_id, count, err(exc))
+        await self.put_kv_data("reply_retry_fails", fails)
         await self.put_kv_data("pending_forum_replies", remaining)
 
     async def add_pending_reply(self, discussion_id):
@@ -795,15 +711,14 @@ class AicueForumPlugin(Star):
             await self.login()
             logger.info("言灵工坊论坛账号登录成功")
         except Exception as exc:
-            logger.warning("言灵工坊论坛账号登录失败，自动回帖暂不可用: %s", exc)
+            logger.warning("言灵工坊论坛账号登录失败，自动回帖暂不可用: %s", err(exc))
         # 恢复之前保存的推送目标会话场景，避免重启后推送失效
         targets = await self.targets()
         for target in targets:
             await self.prepare_qq_target(target)
 
-        if self.task is None:
+        if self.task is None or self.task.done():
             self.task = asyncio.create_task(self.monitor())
-
     async def monitor(self):
         await asyncio.sleep(5)
         while True:
@@ -812,12 +727,12 @@ class AicueForumPlugin(Star):
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                logger.warning("言灵工坊监控失败: %s", exc)
+                logger.warning("言灵工坊监控失败: %s", err(exc))
             await asyncio.sleep(self.cfg_int("check_interval_seconds", 120, minimum=30))
 
     async def check_once(self):
         async with self.check_lock:
-            self.cleanup_screenshots()
+            await self.cleanup_published_images()
             await self.retry_pending_replies()
             raw_seen = await self.get_kv_data("seen_discussions", [])
             seen_ids = [str(x) for x in raw_seen] if isinstance(raw_seen, list) else []
@@ -899,6 +814,14 @@ class AicueForumPlugin(Star):
                 reply_started = []
             reply_started = list(dict.fromkeys(str(x) for x in reply_started))[-1000:]
             reply_started_set = set(reply_started)
+            push_fails = await self.get_kv_data("push_fail_counts", {})
+            if not isinstance(push_fails, dict):
+                push_fails = {}
+            # 群被关掉推送后，它的失败计数会永远留在 KV 里，顺手清掉
+            push_fails = {
+                key: value for key, value in push_fails.items()
+                if str(key).split("@", 1)[-1] in targets
+            }
 
             prepared = {}
             for row in new_rows:
@@ -912,11 +835,10 @@ class AicueForumPlugin(Star):
                         row["attributes"] = {"title": post["title"], "slug": post["url"].rsplit("/", 1)[-1], "author": post["author"], "createdAt": post["created"]}
                     except ForumAPIError as exc:
                         if exc.status not in {404, 410}:
-                            logger.warning("帖子 %s 详情读取失败，保留待重试: %s", row_id, exc)
+                            logger.warning("帖子 %s 详情读取失败，保留待重试: %s", row_id, err(exc))
                             continue
                         retry_targets.pop(row_id, None)
                         await self.put_kv_data("pending_push_targets", retry_targets)
-                        await self.remove_pending(row_id)
                         seen_ids.append(row_id)
                         seen_ids = list(dict.fromkeys(seen_ids))[-1000:]
                         await self.put_kv_data("seen_discussions", seen_ids)
@@ -926,7 +848,7 @@ class AicueForumPlugin(Star):
                         seen.add(row_id)
                         continue
                     except Exception as exc:
-                        logger.warning("帖子 %s 详情读取失败，保留待重试: %s", row_id, exc)
+                        logger.warning("帖子 %s 详情读取失败，保留待重试: %s", row_id, err(exc))
                         continue
                 row_tags = set(row.get("_monitor_tags", ()))
                 row["_monitor_tag"] = next((tag for tag in tags if tag in row_tags), tags[0])
@@ -934,50 +856,50 @@ class AicueForumPlugin(Star):
             await self.put_kv_data("pending_push_targets", retry_targets)
 
             sent_by_row = {row_id: 0 for row_id in prepared}
-            quota_skipped = set()
             screenshots = {}
             for target in targets:
                 target_rows = [row for row_id, row in prepared.items() if target in retry_targets.get(row_id, [])]
-                eligible = await self.qq_quota_eligible(target_rows) if self.is_qq_official_target(target) else target_rows
-                quota_skipped.update(str(row["id"]) for row in target_rows if row not in eligible)
+                eligible = await self.qq_quota_eligible(target_rows, target) if self.is_qq_official_target(target) else target_rows
                 if not eligible:
                     continue
+                # 单轮单群限量，避免积压一次性糊出去把带宽和客户端拖垮
+                eligible = eligible[:self.cfg_int("max_posts_per_push", 5, minimum=1)]
                 grouped = {}
                 for row in eligible:
                     grouped.setdefault(row["_monitor_tag"], []).append(row)
                 try:
+                    markdown_chain, fallback_chain = await self.monitor_delivery_chains(grouped, screenshots)
                     if self.is_qq_official_target(target):
-                        markdown_chain, fallback_chain = await self.monitor_delivery_chains(grouped)
                         sent = await self.send_qq_markdown_target(
                             target, markdown_chain, fallback_chain
                         )
                     else:
-                        sent = await self.send_target(
-                            target, await self.monitor_chain(grouped, screenshots)
-                        )
+                        # OneBot 没有 markdown 段类型，非官 Q 一律走普通图文
+                        sent = await self.send_target(target, fallback_chain)
                     if not sent:
+                        self.note_push_failure(push_fails, eligible, target, retry_targets)
                         continue
                     for row in eligible:
                         row_id = str(row["id"])
                         if self.is_qq_official_target(target):
-                            await self.consume_qq_quota(row_id)
+                            await self.consume_qq_quota(row_id, target)
                         sent_by_row[row_id] += 1
                         retry_targets[row_id].remove(target)
+                        push_fails.pop(self.quota_key(row_id, target), None)
                     await self.put_kv_data("pending_push_targets", retry_targets)
                 except Exception as exc:
-                    logger.warning("新帖汇总推送至 %s 失败: %s", target, exc)
+                    self.note_push_failure(push_fails, eligible, target, retry_targets)
+                    logger.warning("新帖汇总推送至 %s 失败: %s", target, err(exc))
+            await self.put_kv_data("push_fail_counts", push_fails)
+            await self.put_kv_data("pending_push_targets", retry_targets)
 
             for row_id, row in prepared.items():
-                if row_id in quota_skipped:
-                    await self.add_pending(row)
-                else:
-                    await self.remove_pending(row_id)
                 if sent_by_row[row_id] and row_id not in reply_started_set:
                     try:
                         await self.reply(row_id)
                     except Exception as exc:
                         await self.add_pending_reply(row_id)
-                        logger.warning("帖子 %s 已推送但自动回帖失败: %s", row_id, exc)
+                        logger.warning("帖子 %s 已推送但自动回帖失败: %s", row_id, err(exc))
                     reply_started.append(row_id)
                     reply_started = reply_started[-1000:]
                     reply_started_set.add(row_id)
@@ -1015,122 +937,31 @@ class AicueForumPlugin(Star):
         value = getattr(event, "unified_msg_origin", "")
         return str(value() if callable(value) else value).strip()
 
-    def advertisement_upload_key(self, event):
-        return f"{self.origin(event)}:{event.get_sender_id()}"
+    async def target_names(self):
+        names = await self.get_kv_data("target_names", {})
+        return names if isinstance(names, dict) else {}
 
-    def message_images(self, event):
-        message = getattr(getattr(event, "message_obj", None), "message", [])
-        return [part for part in message if isinstance(part, Comp.Image)]
-
-    def cleanup_pending_ad_uploads(self):
-        cutoff = datetime.now().timestamp() - 60
-        self.pending_ad_uploads = {
-            key: created for key, created in self.pending_ad_uploads.items() if created >= cutoff
-        }
-
-    def image_extension(self, content):
-        if content.startswith(b"\x89PNG\r\n\x1a\n"):
-            return ".png"
-        if content.startswith(b"\xff\xd8\xff"):
-            return ".jpg"
-        if content.startswith((b"GIF87a", b"GIF89a")):
-            return ".gif"
-        if len(content) >= 12 and content[:4] == b"RIFF" and content[8:12] == b"WEBP":
-            return ".webp"
-        return None
-
-    async def save_advertisements(self, images):
-        saved = []
-        directory = self.advertisement_directory()
-        directory.mkdir(parents=True, exist_ok=True)
-        for image in images:
-            try:
-                source = Path(await image.convert_to_file_path())
-                if source.stat().st_size > 10 * 1024 * 1024:
-                    raise ValueError("图片超过 10 MiB")
-                content = await asyncio.to_thread(source.read_bytes)
-                extension = self.image_extension(content)
-                if not extension:
-                    raise ValueError("仅支持 PNG、JPEG、GIF、WebP 图片")
-                name = f"ad_{datetime.now():%Y%m%d_%H%M%S_%f}{extension}"
-                target = directory / name
-                temporary = target.with_suffix(".tmp")
-                await asyncio.to_thread(temporary.write_bytes, content)
-                await asyncio.to_thread(temporary.replace, target)
-                saved.append(name)
-            except Exception as exc:
-                logger.warning("保存广告图失败: %s", exc)
-        return saved
-
-    @filter.permission_type(filter.PermissionType.ADMIN)
-    @filter.command("upload_ad_image", alias={"上传图片"})
-    async def upload_ad_image(self, event: AstrMessageEvent):
-        self.cleanup_pending_ad_uploads()
-        key = self.advertisement_upload_key(event)
-        images = self.message_images(event)
-        if images:
-            saved = await self.save_advertisements(images)
-            self.pending_ad_uploads.pop(key, None)
-            if saved:
-                yield event.plain_result(f"成功上传 {len(saved)} 张广告图：\n" + "\n".join(saved))
-            else:
-                yield event.plain_result("上传失败，请确认图片格式正确且单张不超过 10 MiB。")
-            return
-        self.pending_ad_uploads[key] = datetime.now().timestamp()
-        yield event.plain_result("请在 60 秒内发送广告图片，可一次发送多张。")
-
-    @filter.event_message_type(filter.EventMessageType.ALL)
-    async def receive_ad_image(self, event: AstrMessageEvent):
-        self.cleanup_pending_ad_uploads()
-        key = self.advertisement_upload_key(event)
-        if key not in self.pending_ad_uploads or not event.is_admin():
-            return
-        text = (getattr(event, "message_str", "") or "").strip().lstrip("/")
-        if text.startswith(("上传图片", "upload_ad_image")):
-            return
-        images = self.message_images(event)
-        if not images:
-            return
-        saved = await self.save_advertisements(images)
-        self.pending_ad_uploads.pop(key, None)
-        event.stop_event()
-        if saved:
-            yield event.plain_result(f"成功上传 {len(saved)} 张广告图：\n" + "\n".join(saved))
-        else:
-            yield event.plain_result("上传失败，请重新执行 /上传图片。")
-
-    @filter.permission_type(filter.PermissionType.ADMIN)
-    @filter.command("delete_ad_image", alias={"删除图片"})
-    async def delete_ad_image(self, event: AstrMessageEvent, name: str = ""):
-        files = self.advertisement_files()
-        target = None
-        if name.isdigit() and 1 <= int(name) <= len(files):
-            target = files[int(name) - 1]
-        elif name:
-            target = next((path for path in files if path.name == name), None)
-        if not target:
-            yield event.plain_result("未找到指定广告图，请使用 /图片统计 查看序号和文件名。")
-            return
+    async def fetch_group_name(self, target, group_id):
+        """官方 QQ 机器人拿不到群名（openid 是脱敏的），仅 aiocqhttp 可查。"""
+        platform = self.target_platform(target)
+        if not platform or platform.meta().name != "aiocqhttp":
+            return ""
         try:
-            target.unlink()
-        except FileNotFoundError:
-            yield event.plain_result("该广告图刚刚已被删除，请使用 /图片统计 刷新列表。")
-            return
-        yield event.plain_result(f"已删除广告图：{target.name}\n当前剩余 {len(self.advertisement_files())} 张。")
+            info = await platform.get_client().api.call_action("get_group_info", group_id=int(group_id))
+            return str(info.get("group_name") or "").strip()
+        except Exception as exc:
+            logger.debug("获取群名称失败 %s：%s", target, err(exc))
+            return ""
 
-    @filter.permission_type(filter.PermissionType.ADMIN)
-    @filter.command("ad_image_stats", alias={"图片统计"})
-    async def ad_image_stats(self, event: AstrMessageEvent):
-        files = self.advertisement_files()
-        if not files:
-            yield event.plain_result("广告图库当前为空。")
-            return
-        lines = [f"{index}. {path.name}" for index, path in enumerate(files, 1)]
-        yield event.plain_result(f"广告图库共有 {len(files)} 张：\n" + "\n".join(lines))
+    def target_label(self, target, names):
+        note = names.get(target)
+        session_id = str(target).split(":", 2)[-1]
+        short = session_id if len(session_id) <= 12 else f"{session_id[:6]}…{session_id[-4:]}"
+        return f"{note}（{short}）" if note else short
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("push_here", alias={"推送本群"})
-    async def push_here(self, event: AstrMessageEvent):
+    async def push_here(self, event: AstrMessageEvent, note: str = ""):
         origin = self.origin(event)
         if not origin or not event.get_group_id():
             yield event.plain_result("请在需要接收推送的群聊中执行此指令。")
@@ -1148,18 +979,32 @@ class AicueForumPlugin(Star):
                 yield event.plain_result("开启失败：官 Q 会话场景尚未就绪，请在群内重新发送本指令。")
                 return
             targets.append(origin); state = "已开启本群的论坛推送"
+        names = await self.target_names()
+        if origin in targets:
+            label = note.strip() or names.get(origin) or await self.fetch_group_name(origin, event.get_group_id())
+            if label:
+                names[origin] = label
+                state += f"，备注：{label}"
+            else:
+                state += "，建议用「/推送本群 备注名」给本群起个名字，方便在 /推送状态 里分辨"
+        else:
+            names.pop(origin, None)
+        await self.put_kv_data("target_names", names)
         await self.put_kv_data("push_targets", targets)
         yield event.plain_result(state)
 
-    async def show(self, event, rows, title):
-        if not rows:
-            yield event.plain_result(f"{title}\n暂无符合条件的帖子。")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("push_note", alias={"推送备注"})
+    async def push_note(self, event: AstrMessageEvent, index: int = 0, note: str = ""):
+        targets = await self.targets()
+        if not 1 <= index <= len(targets) or not note.strip():
+            listing = " / ".join(f"{i}.{str(x).split(':', 2)[-1][:6]}…" for i, x in enumerate(targets, 1))
+            yield event.plain_result(f"用法：/推送备注 <序号> <名字>\n当前目标：{listing or '无'}")
             return
-        for row in rows[:self.cfg_int("search_result_count", 5, minimum=1, maximum=20)]:
-            try:
-                yield event.chain_result((await self.post_chain(await self.detail(row["id"]))).chain)
-            except Exception as exc:
-                logger.warning("读取帖子 %s 详情失败: %s", row["id"], exc)
+        names = await self.target_names()
+        names[targets[index - 1]] = note.strip()
+        await self.put_kv_data("target_names", names)
+        yield event.plain_result(f"已把第 {index} 个目标备注为：{note.strip()}")
 
     async def query_results(self, event, chain):
         if event.get_platform_name() not in {"qq_official", "qq_official_webhook"}:
@@ -1182,10 +1027,10 @@ class AicueForumPlugin(Star):
             + (newline.join(self.markdown_lines(recent, with_author=True)) or "暂无帖子"),
         ]
         fallback_parts = []
-        image = self.advertisement_image() or Comp.Image.fromFileSystem(
-            Path(__file__).parent / "assets" / "forum_header.png"
-        )
-        fallback_parts.append(image)
+        header = Path(__file__).parent / "assets" / "forum_header.png"
+        image = self.ad_image() or (Comp.Image.fromFileSystem(header) if header.is_file() else None)
+        if image:
+            fallback_parts.append(image)
         lines = []
         for title, rows in ((f"{name}最火帖子：", hot), (f"{name}最近帖子：", recent)):
             lines.append(title)
@@ -1203,16 +1048,17 @@ class AicueForumPlugin(Star):
         fallback = MessageChain(fallback_parts)
         fallback.use_markdown_ = False
         try:
-            image_url, width, height = await self.advertisement_public_url()
-            markdown = MessageChain([MarkdownPlain(
-                f"![论坛图片 #{width}px #{height}px]({image_url})"
-                + newline * 2 + (newline * 2).join(sections)
-            )])
-            markdown.use_markdown_ = True
-            return markdown, fallback
+            image_url, width, height = self.ad_image_url()
+            if str(image_url).startswith(("http://", "https://")):
+                markdown = MessageChain([MarkdownPlain(
+                    f"![论坛图片 #{width}px #{height}px]({image_url})"
+                    + newline * 2 + (newline * 2).join(sections)
+                )])
+                markdown.use_markdown_ = True
+                return markdown, fallback
         except Exception as exc:
-            logger.warning("生成分类查询公网广告图失败，直接使用普通图文：%s", exc)
-            return None, fallback
+            logger.warning("生成分类查询公网广告图失败，降级为普通图文: %s", err(exc))
+        return None, fallback
 
     async def send_qq_category(self, event, markdown, fallback):
         if markdown is None:
@@ -1256,7 +1102,7 @@ class AicueForumPlugin(Star):
                     return []
             return await self.query_results(event, markdown or fallback)
         except Exception as exc:
-            return [event.plain_result(f"查询论坛失败：{exc}")]
+            return [event.plain_result(f"查询论坛失败：{err(exc)}")]
 
     async def all_announcements(self):
         rows = []
@@ -1274,7 +1120,7 @@ class AicueForumPlugin(Star):
             for result in await self.query_results(event, await self.announcement_chain(await self.all_announcements())):
                 yield result
         except Exception as exc:
-            yield event.plain_result(f"查询论坛失败：{exc}")
+            yield event.plain_result(f"查询论坛失败：{err(exc)}")
 
     @filter.command("transit", alias={"中转站"})
     async def transit(self, event: AstrMessageEvent):
@@ -1322,7 +1168,7 @@ class AicueForumPlugin(Star):
             for result in await self.query_results(event, await self.markdown_chain(rows)):
                 yield result
         except Exception as exc:
-            yield event.plain_result(f"查询论坛失败：{exc}")
+            yield event.plain_result(f"查询论坛失败：{err(exc)}")
 
     @filter.command("hot_posts", alias={"最火帖子"})
     async def hot_posts(self, event: AstrMessageEvent):
@@ -1334,25 +1180,69 @@ class AicueForumPlugin(Star):
             for result in await self.query_results(event, await self.markdown_chain(rows)):
                 yield result
         except Exception as exc:
-            yield event.plain_result(f"查询论坛失败：{exc}")
+            yield event.plain_result(f"查询论坛失败：{err(exc)}")
 
-    @filter.command("latest_posts", alias={"最新帖子"})
-    async def latest_posts(self, event: AstrMessageEvent):
-        pending = await self.get_kv_data("pending_latest_posts", [])
-        if not isinstance(pending, list) or not pending:
-            yield event.plain_result("暂无因官 Q 每日推送限额而待发的帖子。")
-            return
-        for start in range(0, len(pending), 20):
-            parts = []
-            for row in pending[start:start + 20]:
-                try:
-                    if parts:
-                        parts.append(Comp.Plain(chr(10) * 2))
-                    parts.extend(self.text_chain(await self.detail(row["id"]), "官 Q 限额待发帖子", True).chain)
-                except Exception as exc:
-                    logger.warning("读取待发帖子 %s 详情失败: %s", row.get("id"), exc)
-            if parts:
-                yield event.chain_result(parts)
+    @filter.command("push_help", alias={"推送帮助", "论坛帮助"})
+    async def push_help(self, event: AstrMessageEvent):
+        lines = [
+            "言灵工坊论坛插件 · 指令一览",
+            "",
+            "【看帖】人人可用",
+            "  /最近帖子     三天内新发布的帖子",
+            "  /最火帖子     监控标签内按回复数排序",
+            "  /公告         全部公告",
+            "",
+            "【分区】人人可用",
+            "  /中转站  /注册器  /破甲词",
+            "  /最新资讯  /技术讨论  /资源分享  /灌水区",
+            "",
+            "【推送管理】仅管理员",
+            "  /推送本群 [备注]   开启或关闭本群推送，可顺手起个名",
+            "  /推送备注 <序号> <名字>   给已开启的群补备注",
+            "  /推送状态          额度用量、各群状态、积压帖数、监控是否在跑",
+            "  /立即检查帖子      不等定时，马上抓一轮新帖",
+            "",
+            f"新帖检查间隔：{self.cfg_int('check_interval_seconds', 120, minimum=30)} 秒",
+            f"单群单轮最多推：{self.cfg_int('max_posts_per_push', 5, minimum=1)} 帖",
+            f"截图保留：{self.cfg_int('image_keep_days', 3, minimum=1)} 天",
+        ]
+        yield event.plain_result("\n".join(lines))
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("push_status", alias={"推送状态"})
+    async def push_status(self, event: AstrMessageEvent):
+        targets = await self.targets()
+        scenes = await self.get_kv_data("qq_target_scenes", {})
+        scenes = scenes if isinstance(scenes, dict) else {}
+        retry = await self.get_kv_data("pending_push_targets", {})
+        retry = retry if isinstance(retry, dict) else {}
+        loaded = [x.meta().id for x in self.context.platform_manager.platform_insts]
+        quota = await self.get_kv_data("qq_daily_quota", {})
+        quota = quota if isinstance(quota, dict) else {}
+        today = datetime.now(timezone(timedelta(hours=8))).date().isoformat()
+        used = quota.get("count", 0) if quota.get("date") == today else 0
+        lines = [
+            f"今日官 Q 主动消息：{used} / {self.cfg_int('qq_daily_push_limit', 1000, minimum=1)} 条",
+            f"监控循环：{'运行中' if self.task and not self.task.done() else '未运行'}",
+            f"已加载平台：{'、'.join(loaded) or '无'}",
+            f"推送目标：{len(targets)} 个",
+        ]
+        names = await self.target_names()
+        for idx, target in enumerate(targets, 1):
+            platform = self.target_platform(target)
+            session_id = str(target).split(":", 2)[-1]
+            scene = scenes.get(target) or (getattr(platform, "_session_scene", None) or {}).get(session_id)
+            msg_id = (getattr(platform, "_session_last_message_id", None) or {}).get(session_id)
+            waiting = sum(1 for x in retry.values() if isinstance(x, list) and target in x)
+            lines.extend([
+                "",
+                f"{idx}. {self.target_label(target, names)}",
+                f"  平台：{platform.meta().name if platform else '× 未找到（推送会被跳过）'}",
+                f"  会话场景：{scene or '未知（推送会被跳过）'}",
+                f"  msg_id 缓存：{'有' if msg_id else '无（走主动消息）'}",
+                f"  积压待推：{waiting} 帖",
+            ])
+        yield event.plain_result("\n".join(lines))
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("forum_check", alias={"立即检查帖子"})
@@ -1361,7 +1251,7 @@ class AicueForumPlugin(Star):
             await self.check_once()
             yield event.plain_result("检查完成。")
         except Exception as exc:
-            yield event.plain_result(f"检查失败：{exc}")
+            yield event.plain_result(f"检查失败：{err(exc)}")
 
     async def terminate(self):
         if self.task:
