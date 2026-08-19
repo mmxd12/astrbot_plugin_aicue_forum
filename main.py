@@ -1335,6 +1335,7 @@ class AicueForumPlugin(Star):
                     "redirect_uri": HELP_BASE + "/oauth/callback",
                     "response_type": "code",
                     "scope": "user.read",
+                    "approval_prompt": "auto",
                 }
                 auth_url = flarum_base + "/oauth/authorize?" + urllib.parse.urlencode(oauth_params)
                 async with s.get(auth_url) as pre_resp:
@@ -1342,18 +1343,26 @@ class AicueForumPlugin(Star):
                     m = re.search(r'"csrfToken":"([^"]+)"', pre_body)
                     oauth_csrf = m.group(1) if m else csrf
                     debug.append(f"✅ OAuth GET: {pre_resp.status} (CSRF: {oauth_csrf[:16]}...)")
-                async with s.post(auth_url,
-                    json={"authorization": "approve"},
-                    headers={"X-CSRF-Token": oauth_csrf, "Content-Type": "application/json"},
+                # 尝试用 GET 方式授权（有些 OAuth 实现支持）
+                async with s.get(auth_url + "&authorization=approve",
+                    headers={"X-CSRF-Token": oauth_csrf},
                     allow_redirects=False) as resp:
-                    debug.append(f"✅ OAuth POST: {resp.status}")
-                    if resp.status not in (302, 303):
-                        body = await resp.text()[:200]
-                        raise RuntimeError(f"OAuth 授权失败（HTTP {resp.status}）: {body}")
+                    debug.append(f"✅ OAuth GET: {resp.status}")
                     location = resp.headers.get("Location", "")
-                    debug.append(f"✅ 重定向到: {location}")
+                    # 如果 GET 不行，再试 POST
+                    if not location:
+                        async with s.post(auth_url,
+                            data="authorization=approve&_token=" + oauth_csrf,
+                            headers={"X-CSRF-Token": oauth_csrf},
+                            allow_redirects=False) as resp2:
+                            debug.append(f"✅ OAuth POST: {resp2.status}")
+                            if resp2.status not in (302, 303):
+                                body = await resp2.text()[:200]
+                                raise RuntimeError(f"OAuth 授权失败（HTTP {resp2.status}）: {body}")
+                            location = resp2.headers.get("Location", "")
                     if not location:
                         raise RuntimeError("OAuth 授权后无重定向地址")
+                    debug.append(f"✅ 重定向到: {location}")
                 # 4. 跟踪回调
                 async with s.get(location, allow_redirects=True) as cb_resp:
                     debug.append(f"✅ 回调: HTTP {cb_resp.status}, URL: {str(cb_resp.url)}")
@@ -1415,6 +1424,7 @@ class AicueForumPlugin(Star):
                     "redirect_uri": HELP_BASE + "/oauth/callback",
                     "response_type": "code",
                     "scope": "user.read",
+                    "approval_prompt": "auto",
                 }
                 auth_url = flarum_base + "/oauth/authorize?" + urllib.parse.urlencode(oauth_params)
                 async with s.get(auth_url) as pre_resp2:
@@ -1422,8 +1432,8 @@ class AicueForumPlugin(Star):
                     m2 = re.search(r'"csrfToken":"([^"]+)"', pre_body2)
                     oauth_csrf2 = m2.group(1) if m2 else csrf
                 async with s.post(auth_url,
-                    json={"authorization": "approve"},
-                    headers={"X-CSRF-Token": oauth_csrf2, "Content-Type": "application/json"},
+                    data="authorization=approve&_token=" + oauth_csrf2,
+                    headers={"X-CSRF-Token": oauth_csrf2, "Content-Type": "application/x-www-form-urlencoded"},
                     allow_redirects=False) as resp:
                     if resp.status not in (302, 303):
                         raise RuntimeError(f"OAuth 授权失败（HTTP {resp.status}）")
