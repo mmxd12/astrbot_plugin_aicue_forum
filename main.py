@@ -1338,10 +1338,13 @@ class AicueForumPlugin(Star):
                 }
                 auth_url = flarum_base + "/oauth/authorize?" + urllib.parse.urlencode(oauth_params)
                 async with s.get(auth_url) as pre_resp:
-                    debug.append(f"✅ OAuth GET: {pre_resp.status}")
+                    pre_body = await pre_resp.text()
+                    m = re.search(r'"csrfToken":"([^"]+)"', pre_body)
+                    oauth_csrf = m.group(1) if m else csrf
+                    debug.append(f"✅ OAuth GET: {pre_resp.status} (CSRF: {oauth_csrf[:16]}...)")
                 async with s.post(auth_url,
-                    data={"authorization": "approve", "_token": csrf},
-                    headers={"X-CSRF-Token": csrf},
+                    data={"authorization": "approve", "csrfToken": oauth_csrf},
+                    headers={"X-CSRF-Token": oauth_csrf},
                     allow_redirects=False) as resp:
                     debug.append(f"✅ OAuth POST: {resp.status}")
                     if resp.status not in (302, 303):
@@ -1414,11 +1417,13 @@ class AicueForumPlugin(Star):
                     "scope": "user.read",
                 }
                 auth_url = flarum_base + "/oauth/authorize?" + urllib.parse.urlencode(oauth_params)
-                async with s.get(auth_url):
-                    pass
+                async with s.get(auth_url) as pre_resp2:
+                    pre_body2 = await pre_resp2.text()
+                    m2 = re.search(r'"csrfToken":"([^"]+)"', pre_body2)
+                    oauth_csrf2 = m2.group(1) if m2 else csrf
                 async with s.post(auth_url,
-                    data={"authorization": "approve", "_token": csrf},
-                    headers={"X-CSRF-Token": csrf},
+                    data={"authorization": "approve", "csrfToken": oauth_csrf2},
+                    headers={"X-CSRF-Token": oauth_csrf2},
                     allow_redirects=False) as resp:
                     if resp.status not in (302, 303):
                         raise RuntimeError(f"OAuth 授权失败（HTTP {resp.status}）")
