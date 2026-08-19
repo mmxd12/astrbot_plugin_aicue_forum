@@ -16,6 +16,8 @@ import astrbot.api.message_components as Comp
 from botpy.types.message import MarkdownPayload
 
 BASE_DEFAULT = "https://www.aicue.top"
+HELP_BASE = "https://help.aicue.top"
+OAUTH_CLIENT_ID = "VOmlyWLHqZV2KCyR1nmryHPSGle7uZk"
 IMAGE_HOST_BASE = "http://zzu2.wch1.top:44788"
 IMAGE_HOST_DIR = "/AstrBot/data/imgs"
 TAG_NAMES = {
@@ -106,7 +108,7 @@ class MarkdownPlain(Comp.Plain):
         return {"type": "text", "data": {"text": self.text}}
 
 
-@register("astrbot_plugin_aicue_forum", "mmxd", "言灵工坊中转站帖子监控与查询", "1.5.23")
+@register("astrbot_plugin_aicue_forum", "mmxd", "言灵工坊中转站帖子监控与查询", "1.5.25")
 class AicueForumPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig = None):
         super().__init__(context)
@@ -556,17 +558,46 @@ class AicueForumPlugin(Star):
                 logger.warning(
                     "官 Q 推送失败（%s）：%s → %s",
                     "主动消息" if attempt_id is None else "被动消息",
-                    target, exc,
+                    target, err(exc),
                 )
         if ret is None:
-            logger.warning("官 Q Markdown 推送全部方式失败，保留待重试：%s（%s）", target, last_error)
+            hint = ""
+            if "权限" in str(last_error) or "permission" in str(last_error).lower():
+                hint = (
+                    "｜主动消息被腾讯侧拒绝：①开放平台该机器人要先拿到「主动消息」权限并已发布上线（沙箱期只有沙箱群能收）；"
+                    "②群里 群资料→机器人→允许主动发送消息 要打开；③主动消息有每群条数上限，用尽也报无权限。"
+                    "临时办法：让群友在群里 @ 一次机器人，5 分钟内插件会改走被动消息把积压帖推出去。"
+                )
+            logger.warning("官 Q Markdown 推送全部方式失败，保留待重试：%s（%s）%s", target, err(last_error), hint)
+            await self.note_target_error(target, err(last_error))
             return False
         sent_id = platform._extract_message_id(ret)
         if not sent_id:
             logger.warning("官 Q Markdown 推送未返回消息 ID，保留待重试：%s", target)
             return False
         platform.remember_session_message_id(session_id, sent_id)
+        await self.note_target_error(target)
         return True
+
+    async def note_target_error(self, target, reason=""):
+        """记住某群最近一次推送被拒的原因，/推送状态 直接显示，不用翻日志。传空表示恢复正常。"""
+        errors = await self.get_kv_data("push_last_error", {})
+        errors = errors if isinstance(errors, dict) else {}
+        if errors.get(str(target), "") == reason:
+            return
+        if reason:
+            errors[str(target)] = reason
+        else:
+            errors.pop(str(target), None)
+        await self.put_kv_data("push_last_error", errors)
+
+    @staticmethod
+    def permission_text(reason, official=True):
+        if not reason:
+            return "已开启全量" if official else "正常"
+        if "权限" in reason or "permission" in reason.lower():
+            return "× 无权限（未开启全量，群资料→机器人→允许主动发送消息）"
+        return f"× 上次失败：{reason}"
 
     async def send_target(self, target, chain):
         if not await self.prepare_qq_target(target):
@@ -1228,18 +1259,22 @@ class AicueForumPlugin(Star):
             f"推送目标：{len(targets)} 个",
         ]
         names = await self.target_names()
+        errors = await self.get_kv_data("push_last_error", {})
+        errors = errors if isinstance(errors, dict) else {}
         for idx, target in enumerate(targets, 1):
             platform = self.target_platform(target)
             session_id = str(target).split(":", 2)[-1]
             scene = scenes.get(target) or (getattr(platform, "_session_scene", None) or {}).get(session_id)
             msg_id = (getattr(platform, "_session_last_message_id", None) or {}).get(session_id)
             waiting = sum(1 for x in retry.values() if isinstance(x, list) and target in x)
+            qq_official = bool(platform) and platform.meta().name in {"qq_official", "qq_official_webhook"}
             lines.extend([
                 "",
                 f"{idx}. {self.target_label(target, names)}",
                 f"  平台：{platform.meta().name if platform else '× 未找到（推送会被跳过）'}",
                 f"  会话场景：{scene or '未知（推送会被跳过）'}",
                 f"  msg_id 缓存：{'有' if msg_id else '无（走主动消息）'}",
+                f"  权限：{self.permission_text(str(errors.get(target, '')), qq_official)}",
                 f"  积压待推：{waiting} 帖",
             ])
         yield event.plain_result("\n".join(lines))
@@ -1252,6 +1287,50 @@ class AicueForumPlugin(Star):
             yield event.plain_result("检查完成。")
         except Exception as exc:
             yield event.plain_result(f"检查失败：{err(exc)}")
+
+    @filter.command("invite_code", alias={"邀请码", "邀请"})
+    async def invite_code(self, event: AstrMessageEvent):
+        """自动申请一个言灵工坊邀请码"""
+        try:
+            session = await self.client()
+            # 1. 登录论坛
+            await self.login()
+            # 2. 走 OAuth 流程获取帮助站 session
+            # 构造 OAuth authorize URL
+            oauth_params = {
+                "client_id": OAUTH_CLIENT_ID,
+                "redirect_uri": HELP_BASE + "/oauth/callback",
+                "response_type": "code",
+                "scope": "user.read",
+            }
+            import urllib.parse
+            auth_url = "https://flarum.aicue.top/oauth/authorize?" + urllib.parse.urlencode(oauth_params)
+            # 访问 OAuth 授权页（带上论坛 cookie）
+            async with session.post(auth_url, data={"approve": "1"}) as resp:
+                if resp.status not in (200, 302):
+                    body = await resp.text()
+                    raise RuntimeError(f"OAuth 授权失败（HTTP {resp.status}）")
+                # 跟踪重定向到 help.aicue.top
+                location = resp.headers.get("Location", "")
+                if location:
+                    async with session.get(location) as cb_resp:
+                        if cb_resp.status >= 400:
+                            raise RuntimeError(f"OAuth 回调失败（HTTP {cb_resp.status}）")
+            # 3. 调用帮助站 API 获取邀请码
+            async with session.get(HELP_BASE + "/api/invite") as inv_resp:
+                inv_data = await inv_resp.json(content_type=None)
+            if inv_data.get("success"):
+                code = inv_data.get("code") or inv_data.get("invite_code") or inv_data.get("data", {}).get("code", "")
+                yield event.plain_result(
+                    f"✅ 邀请码申请成功！\n\n"
+                    f"邀请码：{code}\n"
+                    f"注册地址：{HELP_BASE}/register?code={code}"
+                )
+            else:
+                msg = inv_data.get("msg") or str(inv_data)
+                yield event.plain_result(f"❌ 获取邀请码失败：{msg}")
+        except Exception as exc:
+            yield event.plain_result(f"❌ 申请邀请码异常：{err(exc)}")
 
     async def terminate(self):
         if self.task:
