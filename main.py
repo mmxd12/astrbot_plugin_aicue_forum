@@ -1347,9 +1347,12 @@ class AicueForumPlugin(Star):
                 oauth_cookies = s.cookie_jar.filter_cookies(auth_url)
                 cookie_names = list(oauth_cookies.keys())
                 debug.append(f"✅ OAuth 请求 cookie: {cookie_names}")
-                # 尝试 POST 授权
+                # 从 URL 中提取 state 参数
+                state_match = re.search(r'[?&]state=([^&]+)', auth_url)
+                oauth_state = state_match.group(1) if state_match else ""
+                # 尝试 POST 授权（带上 state 参数）
                 async with s.post(auth_url,
-                    data="authorization=approve&_token=" + oauth_csrf,
+                    data=f"authorization=approve&_token={oauth_csrf}&state={oauth_state}",
                     headers={"X-CSRF-Token": oauth_csrf},
                     allow_redirects=False) as resp2:
                     debug.append(f"✅ OAuth POST: {resp2.status}")
@@ -1428,8 +1431,10 @@ class AicueForumPlugin(Star):
                     pre_body2 = await pre_resp2.text()
                     m2 = re.search(r'"csrfToken":"([^"]+)"', pre_body2)
                     oauth_csrf2 = m2.group(1) if m2 else csrf
+                state_match2 = re.search(r'[?&]state=([^&]+)', auth_url)
+                oauth_state = state_match2.group(1) if state_match2 else ""
                 async with s.post(auth_url,
-                    data="authorization=approve&_token=" + oauth_csrf2,
+                    data=f"authorization=approve&_token={oauth_csrf2}&state={oauth_state}",
                     headers={"X-CSRF-Token": oauth_csrf2, "Content-Type": "application/x-www-form-urlencoded"},
                     allow_redirects=False) as resp:
                     if resp.status not in (302, 303):
