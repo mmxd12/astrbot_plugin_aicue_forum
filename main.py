@@ -1295,40 +1295,125 @@ class AicueForumPlugin(Star):
     @filter.command("invite_code", alias={"邀请码", "邀请"})
     async def invite_code(self, event: AstrMessageEvent):
         """自动申请一个言灵工坊邀请码"""
-        # 获取帮助站会话 cookie
+        # 先尝试用缓存的 PHPSESSID
         help_session = str(self.cfg("help_session", "")).strip()
-        if not help_session:
-            yield event.plain_result(
-                "❌ 未配置帮助站登录 session，请用 /help_login 登录后使用"
-            )
-            return
+        if help_session:
+            try:
+                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as s:
+                    ck = {"Cookie": f"PHPSESSID={help_session}"}
+                    async with s.get(HELP_BASE + "/user/invite", headers=ck) as resp:
+                        body = await resp.text()
+                        m = re.search(r'id="csrfToken" value="([^"]+)"', body)
+                        if m:
+                            csrf = m.group(1)
+                            post_headers = {"Cookie": f"PHPSESSID={help_session}", "X-Requested-With": "XMLHttpRequest"}
+                            async with s.post(HELP_BASE + "/user/invite_api?action=create",
+                                json={"csrf_token": csrf},
+                                headers=post_headers) as resp2:
+                                data = await resp2.json(content_type=None)
+                            if data.get("success"):
+                                code = data.get("invite", {}).get("code") or data.get("code", "")
+                                yield event.plain_result(
+                                    f"✅ 邀请码申请成功！\n\n"
+                                    f"邀请码：{code}\n"
+                                    f"注册地址：{HELP_BASE}/register?code={code}"
+                                )
+                                return
+                            elif data.get("msg") and "次数" in data.get("msg", ""):
+                                yield event.plain_result(f"❌ {data['msg']}")
+                                return
+            except Exception:
+                pass  # session 过期，走 OAuth 重新登录
+        
+        # PHPSESSID 无效或过期，用 Playwright 自动完成 OAuth 授权
+        yield event.plain_result("🔄 登录 session 已过期，正在自动重新登录...")
+        import asyncio
+        from playwright.sync_api import sync_playwright
+        import time, re as _re
+        
         try:
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as s:
-                ck = {"Cookie": f"PHPSESSID={help_session}"}
-                async with s.get(HELP_BASE + "/user/invite", headers=ck) as resp:
+            # 论坛登录
+            async with aiohttp.ClientSession() as s:
+                async with s.get("https://flarum.aicue.top/") as resp:
                     body = await resp.text()
-                    m = re.search(r'id="csrfToken" value="([^"]+)"', body)
-                    if not m:
-                        yield event.plain_result("❌ 无法获取 CSRF token，请重新 /help_login")
-                        return
-                    csrf = m.group(1)
-                # 创建邀请码
-                post_headers = {"Cookie": f"PHPSESSID={help_session}", "X-Requested-With": "XMLHttpRequest"}
-                async with s.post(HELP_BASE + "/user/invite_api?action=create",
-                    json={"csrf_token": csrf},
-                    headers=post_headers) as resp:
-                    data = await resp.json(content_type=None)
-                if data.get("success"):
-                    code = data.get("invite", {}).get("code") or data.get("code", "")
-                    yield event.plain_result(
-                        f"✅ 邀请码申请成功！\n\n"
-                        f"邀请码：{code}\n"
-                        f"注册地址：{HELP_BASE}/register?code={code}"
-                    )
-                else:
-                    yield event.plain_result(f"❌ {data.get('msg', '申请失败')}")
+                    csrf = _re.search(r'"csrfToken":"([^"]+)"', body).group(1)
+                async with s.post("https://flarum.aicue.top/login",
+                    json={"identification": str(self.cfg("forum_username", "")), "password": str(self.cfg("forum_password", "")), "remember": True},
+                    headers={"Accept": "application/vnd.api+json", "X-CSRF-Token": csrf}) as resp:
+                    pass
+                forum_cookies = {}
+                for c in s.cookie_jar:
+                    forum_cookies[c.key] = c.value
+            
+            new_session = None
+            with sync_playwright() as pw:
+                browser = pw.chromium.launch(headless=True, args=['--no-sandbox'])
+                context = browser.new_context()
+                page = context.new_page()
+                
+                # 访问帮助站 → 点"用论坛账号登录"
+                page.goto(HELP_BASE + "/user/invite", wait_until="domcontentloaded", timeout=30000)
+                time.sleep(3)
+                login_btn = page.locator("a.btn-login")
+                if login_btn.is_visible():
+                    login_btn.click()
+                    time.sleep(5)
+                
+                # 设置论坛 cookie
+                for name, value in forum_cookies.items():
+                    context.add_cookies([{
+                        "name": name, "value": value,
+                        "domain": "flarum.aicue.top", "path": "/",
+                        "httpOnly": True, "secure": True, "sameSite": "Lax"
+                    }])
+                
+                # 刷新 OAuth 页
+                page.goto(page.url, wait_until="domcontentloaded", timeout=60000)
+                time.sleep(8)
+                
+                # 点 Agree
+                agree = page.locator('button:has-text("Agree")')
+                if agree.is_visible():
+                    agree.click()
+                    time.sleep(5)
+                
+                # 获取新 PHPSESSID
+                for c in context.cookies():
+                    if c["domain"] == "help.aicue.top" and c["name"] == "PHPSESSID":
+                        new_session = c["value"]
+                
+                browser.close()
+            
+            if new_session:
+                # 保存到配置
+                self.config["help_session"] = new_session
+                # 调用 API
+                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as s:
+                    ck = {"Cookie": f"PHPSESSID={new_session}"}
+                    async with s.get(HELP_BASE + "/user/invite", headers=ck) as resp:
+                        body = await resp.text()
+                        m = _re.search(r'id="csrfToken" value="([^"]+)"', body)
+                        if m:
+                            csrf = m.group(1)
+                            async with s.post(HELP_BASE + "/user/invite_api?action=create",
+                                json={"csrf_token": csrf},
+                                headers={"Cookie": f"PHPSESSID={new_session}", "X-Requested-With": "XMLHttpRequest"}) as resp2:
+                                data = await resp2.json(content_type=None)
+                            if data.get("success"):
+                                code = data.get("invite", {}).get("code") or data.get("code", "")
+                                yield event.plain_result(
+                                    f"✅ 邀请码申请成功！\n\n"
+                                    f"邀请码：{code}\n"
+                                    f"注册地址：{HELP_BASE}/register?code={code}"
+                                )
+                            else:
+                                yield event.plain_result(f"❌ {data.get('msg', '申请失败')}")
+                        else:
+                            yield event.plain_result("❌ OAuth 登录成功但无法获取 CSRF token")
+            else:
+                yield event.plain_result("❌ OAuth 自动登录失败，请用 /help_login 手动配置 session")
         except Exception as exc:
-            yield event.plain_result(f"❌ 申请邀请码异常：{err(exc)}")
+            yield event.plain_result(f"❌ 自动登录异常：{err(exc)}")
 
     @filter.command("help_login", alias={"登录帮助站", "帮助站登录"})
     async def help_login(self, event: AstrMessageEvent):
