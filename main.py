@@ -1325,19 +1325,25 @@ class AicueForumPlugin(Star):
                     "scope": "user.read",
                 }
                 auth_url = flarum_base + "/oauth/authorize?" + urllib.parse.urlencode(oauth_params)
-                # POST 授权
+                # 先 GET 一下 OAuth 页面（确保 session 就绪）
+                async with oauth_session.get(auth_url) as pre_resp:
+                    pass
+                # POST 授权（不自动跟随重定向，手动跟踪）
                 async with oauth_session.post(auth_url,
                     data={"approve": "1"},
-                    headers={"X-CSRF-Token": csrf}) as resp:
-                    if resp.status not in (200, 302, 303):
+                    headers={"X-CSRF-Token": csrf},
+                    allow_redirects=False) as resp:
+                    if resp.status not in (302, 303):
                         body = await resp.text()[:200]
                         raise RuntimeError(f"OAuth 授权失败（HTTP {resp.status}）: {body}")
                     location = resp.headers.get("Location", "")
-                    if location:
-                        async with oauth_session.get(location) as cb_resp:
-                            if cb_resp.status >= 400:
-                                raise RuntimeError(f"OAuth 回调失败（HTTP {cb_resp.status}）")
-                # 4. 调用帮助站 API 获取邀请码
+                    if not location:
+                        raise RuntimeError("OAuth 授权后无重定向地址")
+                # 4. 跟随重定向到帮助站回调（允许自动跟随后续重定向）
+                async with oauth_session.get(location, allow_redirects=True) as cb_resp:
+                    if cb_resp.status >= 400:
+                        raise RuntimeError(f"OAuth 回调失败（HTTP {cb_resp.status}）")
+                # 5. 调用帮助站 API 获取邀请码
                 async with oauth_session.get(HELP_BASE + "/api/invite") as inv_resp:
                     status = inv_resp.status
                     inv_data = await inv_resp.json(content_type=None)
