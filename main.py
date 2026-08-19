@@ -1291,65 +1291,66 @@ class AicueForumPlugin(Star):
     @filter.command("invite_code", alias={"邀请码", "邀请"})
     async def invite_code(self, event: AstrMessageEvent):
         """自动申请一个言灵工坊邀请码"""
+        import urllib.parse
+        # 用独立的 session 走 OAuth（flarum.aicue.top 是国际版，与 www.aicue.top 不同实例）
+        flarum_base = "https://flarum.aicue.top"
         try:
-            import urllib.parse
-            from urllib.parse import urlparse
-            session = await self.client()
-            # 1. 登录论坛
-            await self.login()
-            # 2. 把论坛 session cookie 复制到 flarum.aicue.top 域
-            flarum_domain = "flarum.aicue.top"
-            forum_cookies = session.cookie_jar.filter_cookies("https://www.aicue.top/")
-            flarum_session_cookie = forum_cookies.get("flarum_session")
-            flarum_csrf = ""
-            if flarum_session_cookie:
-                # 手动设置 flarum domain 的 cookie
-                session.cookie_jar.update_cookies(
-                    {"flarum_session": flarum_session_cookie.value},
-                    f"https://{flarum_domain}/"
-                )
-            # 获取 flarum 的 CSRF token
-            async with session.get(f"https://{flarum_domain}/") as resp:
-                body = await resp.text()
-                m = re.search(r'"csrfToken":"([^"]+)"', body)
-                if m:
-                    flarum_csrf = m.group(1)
-            # 3. 走 OAuth 流程
-            oauth_params = {
-                "client_id": OAUTH_CLIENT_ID,
-                "redirect_uri": HELP_BASE + "/oauth/callback",
-                "response_type": "code",
-                "scope": "user.read",
-            }
-            auth_url = f"https://{flarum_domain}/oauth/authorize?" + urllib.parse.urlencode(oauth_params)
-            # 先 GET 到 OAuth 页面（带 cookie 会自动登录），再 POST approve
-            async with session.get(auth_url) as pre_resp:
-                pre_body = await pre_resp.text()
-            # POST 授权
-            headers = {"X-CSRF-Token": flarum_csrf} if flarum_csrf else {}
-            async with session.post(auth_url, data={"approve": "1"}, headers=headers) as resp:
-                if resp.status not in (200, 302, 303):
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as oauth_session:
+                # 1. 登录 flarum 国际版
+                async with oauth_session.get(flarum_base + "/") as resp:
                     body = await resp.text()
-                    raise RuntimeError(f"OAuth 授权失败（HTTP {resp.status}）: {body[:200]}")
-                location = resp.headers.get("Location", "")
-                if location:
-                    async with session.get(location) as cb_resp:
-                        if cb_resp.status >= 400:
-                            raise RuntimeError(f"OAuth 回调失败（HTTP {cb_resp.status}）")
-            # 4. 调用帮助站 API 获取邀请码
-            async with session.get(HELP_BASE + "/api/invite") as inv_resp:
-                status = inv_resp.status
-                inv_data = await inv_resp.json(content_type=None)
-            if inv_data.get("success"):
-                code = inv_data.get("code") or inv_data.get("invite_code") or inv_data.get("data", {}).get("code", "")
-                yield event.plain_result(
-                    f"✅ 邀请码申请成功！\n\n"
-                    f"邀请码：{code}\n"
-                    f"注册地址：{HELP_BASE}/register?code={code}"
-                )
-            else:
-                msg = inv_data.get("msg") or str(inv_data)
-                yield event.plain_result(f"❌ 获取邀请码失败（HTTP {status}）：{msg}")
+                    m = re.search(r'"csrfToken":"([^"]+)"', body)
+                    csrf = m.group(1) if m else ""
+                username = str(self.cfg("forum_username", "")).strip()
+                password = str(self.cfg("forum_password", ""))
+                if not username or not password:
+                    yield event.plain_result("❌ 未配置论坛账号，请在设置中填写 forum_username 和 forum_password")
+                    return
+                payload = {"identification": username, "password": password, "remember": True}
+                async with oauth_session.post(flarum_base + "/login",
+                    json=payload,
+                    headers={"Accept": "application/vnd.api+json", "X-CSRF-Token": csrf}) as resp:
+                    if resp.status >= 400:
+                        raise RuntimeError(f"登录国际版失败（HTTP {resp.status}）")
+                # 2. 再获取一次 CSRF（登录后刷新）
+                async with oauth_session.get(flarum_base + "/") as resp:
+                    body = await resp.text()
+                    m = re.search(r'"csrfToken":"([^"]+)"', body)
+                    csrf = m.group(1) if m else ""
+                # 3. 走 OAuth 授权
+                oauth_params = {
+                    "client_id": OAUTH_CLIENT_ID,
+                    "redirect_uri": HELP_BASE + "/oauth/callback",
+                    "response_type": "code",
+                    "scope": "user.read",
+                }
+                auth_url = flarum_base + "/oauth/authorize?" + urllib.parse.urlencode(oauth_params)
+                # POST 授权
+                async with oauth_session.post(auth_url,
+                    data={"approve": "1"},
+                    headers={"X-CSRF-Token": csrf}) as resp:
+                    if resp.status not in (200, 302, 303):
+                        body = await resp.text()[:200]
+                        raise RuntimeError(f"OAuth 授权失败（HTTP {resp.status}）: {body}")
+                    location = resp.headers.get("Location", "")
+                    if location:
+                        async with oauth_session.get(location) as cb_resp:
+                            if cb_resp.status >= 400:
+                                raise RuntimeError(f"OAuth 回调失败（HTTP {cb_resp.status}）")
+                # 4. 调用帮助站 API 获取邀请码
+                async with oauth_session.get(HELP_BASE + "/api/invite") as inv_resp:
+                    status = inv_resp.status
+                    inv_data = await inv_resp.json(content_type=None)
+                if inv_data.get("success"):
+                    code = inv_data.get("code") or inv_data.get("invite_code") or inv_data.get("data", {}).get("code", "")
+                    yield event.plain_result(
+                        f"✅ 邀请码申请成功！\n\n"
+                        f"邀请码：{code}\n"
+                        f"注册地址：{HELP_BASE}/register?code={code}"
+                    )
+                else:
+                    msg = inv_data.get("msg") or str(inv_data)
+                    yield event.plain_result(f"❌ 获取邀请码失败（HTTP {status}）：{msg}")
         except Exception as exc:
             yield event.plain_result(f"❌ 申请邀请码异常：{err(exc)}")
 
