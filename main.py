@@ -1227,6 +1227,10 @@ class AicueForumPlugin(Star):
             "  /中转站  /注册器  /破甲词",
             "  /最新资讯  /技术讨论  /资源分享  /灌水区",
             "",
+            "【邀请码】人人可用",
+            "  /邀请码       申请一个新的邀请码",
+            "  /我的邀请码   查看已申请的邀请码及状态",
+            "",
             "【推送管理】仅管理员",
             "  /推送本群 [备注]   开启或关闭本群推送，可顺手起个名",
             "  /推送备注 <序号> <名字>   给已开启的群补备注",
@@ -1292,12 +1296,12 @@ class AicueForumPlugin(Star):
     async def invite_code(self, event: AstrMessageEvent):
         """自动申请一个言灵工坊邀请码"""
         import urllib.parse
-        # 用独立的 session 走 OAuth（flarum.aicue.top 是国际版，与 www.aicue.top 不同实例）
         flarum_base = "https://flarum.aicue.top"
+        debug = []
         try:
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as oauth_session:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as s:
                 # 1. 登录 flarum 国际版
-                async with oauth_session.get(flarum_base + "/") as resp:
+                async with s.get(flarum_base + "/") as resp:
                     body = await resp.text()
                     m = re.search(r'"csrfToken":"([^"]+)"', body)
                     csrf = m.group(1) if m else ""
@@ -1307,17 +1311,20 @@ class AicueForumPlugin(Star):
                     yield event.plain_result("❌ 未配置论坛账号，请在设置中填写 forum_username 和 forum_password")
                     return
                 payload = {"identification": username, "password": password, "remember": True}
-                async with oauth_session.post(flarum_base + "/login",
+                async with s.post(flarum_base + "/login",
                     json=payload,
                     headers={"Accept": "application/vnd.api+json", "X-CSRF-Token": csrf}) as resp:
                     if resp.status >= 400:
-                        raise RuntimeError(f"登录国际版失败（HTTP {resp.status}）")
-                # 2. 再获取一次 CSRF（登录后刷新）
-                async with oauth_session.get(flarum_base + "/") as resp:
+                        body = await resp.text()[:100]
+                        raise RuntimeError(f"登录国际版失败（HTTP {resp.status}）: {body}")
+                debug.append("✅ 登录 flarum 成功")
+                # 2. 再获取 CSRF
+                async with s.get(flarum_base + "/") as resp:
                     body = await resp.text()
                     m = re.search(r'"csrfToken":"([^"]+)"', body)
                     csrf = m.group(1) if m else ""
-                # 3. 走 OAuth 授权
+                debug.append(f"✅ CSRF: {csrf[:16]}...")
+                # 3. OAuth 授权
                 oauth_params = {
                     "client_id": OAUTH_CLIENT_ID,
                     "redirect_uri": HELP_BASE + "/oauth/callback",
@@ -1325,28 +1332,30 @@ class AicueForumPlugin(Star):
                     "scope": "user.read",
                 }
                 auth_url = flarum_base + "/oauth/authorize?" + urllib.parse.urlencode(oauth_params)
-                # 先 GET 一下 OAuth 页面（确保 session 就绪）
-                async with oauth_session.get(auth_url) as pre_resp:
-                    pass
-                # POST 授权（不自动跟随重定向，手动跟踪）
-                async with oauth_session.post(auth_url,
+                async with s.get(auth_url) as pre_resp:
+                    debug.append(f"✅ OAuth GET: {pre_resp.status}")
+                async with s.post(auth_url,
                     data={"approve": "1"},
                     headers={"X-CSRF-Token": csrf},
                     allow_redirects=False) as resp:
+                    debug.append(f"✅ OAuth POST: {resp.status}")
                     if resp.status not in (302, 303):
                         body = await resp.text()[:200]
                         raise RuntimeError(f"OAuth 授权失败（HTTP {resp.status}）: {body}")
                     location = resp.headers.get("Location", "")
+                    debug.append(f"✅ 重定向到: {location}")
                     if not location:
                         raise RuntimeError("OAuth 授权后无重定向地址")
-                # 4. 跟随重定向到帮助站回调（允许自动跟随后续重定向）
-                async with oauth_session.get(location, allow_redirects=True) as cb_resp:
+                # 4. 跟踪回调
+                async with s.get(location, allow_redirects=True) as cb_resp:
+                    debug.append(f"✅ 回调: HTTP {cb_resp.status}, URL: {str(cb_resp.url)}")
                     if cb_resp.status >= 400:
                         raise RuntimeError(f"OAuth 回调失败（HTTP {cb_resp.status}）")
-                # 5. 调用帮助站 API 获取邀请码
-                async with oauth_session.get(HELP_BASE + "/api/invite") as inv_resp:
+                # 5. 调 API 获取邀请码
+                async with s.get(HELP_BASE + "/api/invite") as inv_resp:
                     status = inv_resp.status
                     inv_data = await inv_resp.json(content_type=None)
+                    debug.append(f"✅ API: HTTP {status} -> {inv_data}")
                 if inv_data.get("success"):
                     code = inv_data.get("code") or inv_data.get("invite_code") or inv_data.get("data", {}).get("code", "")
                     yield event.plain_result(
@@ -1356,9 +1365,84 @@ class AicueForumPlugin(Star):
                     )
                 else:
                     msg = inv_data.get("msg") or str(inv_data)
-                    yield event.plain_result(f"❌ 获取邀请码失败（HTTP {status}）：{msg}")
+                    yield event.plain_result(
+                        f"❌ 获取邀请码失败（HTTP {status}）：{msg}\n\n"
+                        f"【调试信息】\n" + "\n".join(debug)
+                    )
         except Exception as exc:
-            yield event.plain_result(f"❌ 申请邀请码异常：{err(exc)}")
+            yield event.plain_result(
+                f"❌ 申请邀请码异常：{err(exc)}\n\n"
+                f"【调试信息】\n" + "\n".join(debug)
+            )
+
+    @filter.command("my_invite_codes", alias={"我的邀请码"})
+    async def my_invite_codes(self, event: AstrMessageEvent):
+        """查看我申请的邀请码及使用状态"""
+        import urllib.parse
+        flarum_base = "https://flarum.aicue.top"
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as s:
+                # 1. 登录 flarum
+                async with s.get(flarum_base + "/") as resp:
+                    body = await resp.text()
+                    m = re.search(r'"csrfToken":"([^"]+)"', body)
+                    csrf = m.group(1) if m else ""
+                username = str(self.cfg("forum_username", "")).strip()
+                password = str(self.cfg("forum_password", ""))
+                if not username or not password:
+                    yield event.plain_result("❌ 未配置论坛账号")
+                    return
+                async with s.post(flarum_base + "/login",
+                    json={"identification": username, "password": password, "remember": True},
+                    headers={"Accept": "application/vnd.api+json", "X-CSRF-Token": csrf}) as resp:
+                    if resp.status >= 400:
+                        raise RuntimeError(f"登录失败（HTTP {resp.status}）")
+                # 2. OAuth
+                async with s.get(flarum_base + "/") as resp:
+                    body = await resp.text()
+                    m = re.search(r'"csrfToken":"([^"]+)"', body)
+                    csrf = m.group(1) if m else ""
+                oauth_params = {
+                    "client_id": OAUTH_CLIENT_ID,
+                    "redirect_uri": HELP_BASE + "/oauth/callback",
+                    "response_type": "code",
+                    "scope": "user.read",
+                }
+                auth_url = flarum_base + "/oauth/authorize?" + urllib.parse.urlencode(oauth_params)
+                async with s.get(auth_url):
+                    pass
+                async with s.post(auth_url,
+                    data={"approve": "1"},
+                    headers={"X-CSRF-Token": csrf},
+                    allow_redirects=False) as resp:
+                    if resp.status not in (302, 303):
+                        raise RuntimeError(f"OAuth 授权失败（HTTP {resp.status}）")
+                    location = resp.headers.get("Location", "")
+                    if not location:
+                        raise RuntimeError("OAuth 无重定向")
+                async with s.get(location, allow_redirects=True):
+                    pass
+                # 3. 获取邀请码列表（POST 方式试试）
+                async with s.get(HELP_BASE + "/api/invite") as inv_resp:
+                    inv_data = await inv_resp.json(content_type=None)
+                if isinstance(inv_data, list):
+                    lines = ["📋 我的邀请码"]
+                    for i, item in enumerate(inv_data, 1):
+                        code = item.get("code", "?")
+                        used = item.get("used", item.get("is_used", False))
+                        status_icon = "✅ 已使用" if used else "🟢 未使用"
+                        lines.append(f"  {i}. {code}  {status_icon}")
+                    yield event.plain_result("\n".join(lines))
+                elif inv_data.get("success"):
+                    code = inv_data.get("code", "?")
+                    used = inv_data.get("used", inv_data.get("is_used", False))
+                    status_icon = "✅ 已使用" if used else "🟢 未使用"
+                    yield event.plain_result(f"📋 邀请码：{code}\n状态：{status_icon}")
+                else:
+                    msg = inv_data.get("msg") or str(inv_data)
+                    yield event.plain_result(f"❌ 查询失败：{msg}")
+        except Exception as exc:
+            yield event.plain_result(f"❌ 查询异常：{err(exc)}")
 
     async def terminate(self):
         if self.task:
