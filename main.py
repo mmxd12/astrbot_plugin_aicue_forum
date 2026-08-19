@@ -1482,20 +1482,24 @@ class AicueForumPlugin(Star):
                 if data.get("success"):
                     stats = data.get("stats", {})
                     codes = data.get("codes", data.get("invite_codes", []))
+                    total = stats.get('total_codes', '?')
+                    used_codes = [c['code'] for c in codes if c.get('used', c.get('is_used', False))]
+                    remaining = data.get('remaining', '?')
+                    if used_codes:
+                        if len(used_codes) > 4:
+                            parts = []
+                            for i in range(0, len(used_codes), 4):
+                                parts.append("，".join(used_codes[i:i+4]))
+                            used_str = "，" + "\n".join(parts)
+                        else:
+                            used_str = "，".join(used_codes)
+                    else:
+                        used_str = "无"
                     lines = [
-                        "📋 我的邀请码",
-                        f"  总计：{stats.get('total_codes', '?')} 个",
-                        f"  已使用：{stats.get('used_codes', '?')} 个",
-                        f"  已邀请：{stats.get('invited_count', '?')} 人",
-                        f"  剩余配额：{data.get('remaining', '?')}",
+                        f"邀请码总计：{total}个",
+                        f"已使用：{used_str}",
+                        f"剩余配额：{remaining}",
                     ]
-                    if codes:
-                        lines.append("")
-                        for i, item in enumerate(codes, 1):
-                            code = item.get("code", "?")
-                            used = item.get("used", item.get("is_used", False))
-                            status_icon = "✅" if used else "🟢"
-                            lines.append(f"  {status_icon} {code}")
                     yield event.plain_result("\n".join(lines))
                 else:
                     yield event.plain_result(f"❌ {data.get('msg', '查询失败')}")
