@@ -1343,23 +1343,20 @@ class AicueForumPlugin(Star):
                     m = re.search(r'"csrfToken":"([^"]+)"', pre_body)
                     oauth_csrf = m.group(1) if m else csrf
                     debug.append(f"✅ OAuth GET: {pre_resp.status} (CSRF: {oauth_csrf[:16]}...)")
-                # 尝试用 GET 方式授权（有些 OAuth 实现支持）
-                async with s.get(auth_url + "&authorization=approve",
+                # 检查 OAuth 请求时的 cookie
+                oauth_cookies = s.cookie_jar.filter_cookies(auth_url)
+                cookie_names = list(oauth_cookies.keys())
+                debug.append(f"✅ OAuth 请求 cookie: {cookie_names}")
+                # 尝试 POST 授权
+                async with s.post(auth_url,
+                    data="authorization=approve&_token=" + oauth_csrf,
                     headers={"X-CSRF-Token": oauth_csrf},
-                    allow_redirects=False) as resp:
-                    debug.append(f"✅ OAuth GET: {resp.status}")
-                    location = resp.headers.get("Location", "")
-                    # 如果 GET 不行，再试 POST
-                    if not location:
-                        async with s.post(auth_url,
-                            data="authorization=approve&_token=" + oauth_csrf,
-                            headers={"X-CSRF-Token": oauth_csrf},
-                            allow_redirects=False) as resp2:
-                            debug.append(f"✅ OAuth POST: {resp2.status}")
-                            if resp2.status not in (302, 303):
-                                body = await resp2.text()[:200]
-                                raise RuntimeError(f"OAuth 授权失败（HTTP {resp2.status}）: {body}")
-                            location = resp2.headers.get("Location", "")
+                    allow_redirects=False) as resp2:
+                    debug.append(f"✅ OAuth POST: {resp2.status}")
+                    if resp2.status not in (302, 303):
+                        body = await resp2.text()[:200]
+                        raise RuntimeError(f"OAuth 授权失败（HTTP {resp2.status}）: {body}")
+                    location = resp2.headers.get("Location", "")
                     if not location:
                         raise RuntimeError("OAuth 授权后无重定向地址")
                     debug.append(f"✅ 重定向到: {location}")
