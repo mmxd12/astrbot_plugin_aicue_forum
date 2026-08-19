@@ -1295,101 +1295,63 @@ class AicueForumPlugin(Star):
     @filter.command("invite_code", alias={"邀请码", "邀请"})
     async def invite_code(self, event: AstrMessageEvent):
         """自动申请一个言灵工坊邀请码"""
-        import urllib.parse
-        flarum_base = "https://flarum.aicue.top"
-        debug = []
+        # 获取帮助站会话 cookie
+        help_session = str(self.cfg("help_session", "")).strip()
+        if not help_session:
+            yield event.plain_result(
+                "❌ 未配置帮助站登录 session，请用 /help_login 登录后使用"
+            )
+            return
         try:
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as s:
-                # 1. 登录 flarum 国际版
-                async with s.get(flarum_base + "/") as resp:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as s:
+                ck = {"Cookie": f"PHPSESSID={help_session}"}
+                async with s.get(HELP_BASE + "/user/invite", headers=ck) as resp:
                     body = await resp.text()
-                    m = re.search(r'"csrfToken":"([^"]+)"', body)
-                    csrf = m.group(1) if m else ""
-                username = str(self.cfg("forum_username", "")).strip()
-                password = str(self.cfg("forum_password", ""))
-                if not username or not password:
-                    yield event.plain_result("❌ 未配置论坛账号，请在设置中填写 forum_username 和 forum_password")
-                    return
-                payload = {"identification": username, "password": password, "remember": True}
-                async with s.post(flarum_base + "/login",
-                    json=payload,
-                    headers={"Accept": "application/vnd.api+json", "X-CSRF-Token": csrf}) as resp:
-                    if resp.status >= 400:
-                        body = await resp.text()[:100]
-                        raise RuntimeError(f"登录国际版失败（HTTP {resp.status}）: {body}")
-                # 检查登录后的 cookie
-                login_cookies = s.cookie_jar.filter_cookies(flarum_base + "/")
-                has_session = "flarum_session" in login_cookies
-                debug.append(f"✅ 登录 flarum 成功 (session: {'有' if has_session else '无'})")
-                # 2. 再获取 CSRF + 检查 userId
-                async with s.get(flarum_base + "/") as resp:
-                    body = await resp.text()
-                    m = re.search(r'"csrfToken":"([^"]+)"', body)
-                    csrf = m.group(1) if m else ""
-                    m2 = re.search(r'"userId":(\d+)', body)
-                    uid = m2.group(1) if m2 else "?"
-                    debug.append(f"✅ CSRF: {csrf[:16]}... userId: {uid}")
-                # 3. OAuth 授权
-                oauth_params = {
-                    "client_id": OAUTH_CLIENT_ID,
-                    "redirect_uri": HELP_BASE + "/oauth/callback",
-                    "response_type": "code",
-                    "scope": "user.read",
-                    "approval_prompt": "auto",
-                }
-                auth_url = flarum_base + "/oauth/authorize?" + urllib.parse.urlencode(oauth_params)
-                async with s.get(auth_url) as pre_resp:
-                    pre_body = await pre_resp.text()
-                    m = re.search(r'"csrfToken":"([^"]+)"', pre_body)
-                    oauth_csrf = m.group(1) if m else csrf
-                    debug.append(f"✅ OAuth GET: {pre_resp.status} (CSRF: {oauth_csrf[:16]}...)")
-                # 检查 OAuth 请求时的 cookie
-                oauth_cookies = s.cookie_jar.filter_cookies(auth_url)
-                cookie_names = list(oauth_cookies.keys())
-                debug.append(f"✅ OAuth 请求 cookie: {cookie_names}")
-                # 从 URL 中提取 state 参数
-                state_match = re.search(r'[?&]state=([^&]+)', auth_url)
-                oauth_state = state_match.group(1) if state_match else ""
-                # 尝试 POST 授权（带上 state 参数）
-                async with s.post(auth_url,
-                    data=f"authorization=approve&_token={oauth_csrf}&state={oauth_state}",
-                    headers={"X-CSRF-Token": oauth_csrf},
-                    allow_redirects=False) as resp2:
-                    debug.append(f"✅ OAuth POST: {resp2.status}")
-                    if resp2.status not in (302, 303):
-                        body = await resp2.text()[:200]
-                        raise RuntimeError(f"OAuth 授权失败（HTTP {resp2.status}）: {body}")
-                    location = resp2.headers.get("Location", "")
-                    if not location:
-                        raise RuntimeError("OAuth 授权后无重定向地址")
-                    debug.append(f"✅ 重定向到: {location}")
-                # 4. 跟踪回调
-                async with s.get(location, allow_redirects=True) as cb_resp:
-                    debug.append(f"✅ 回调: HTTP {cb_resp.status}, URL: {str(cb_resp.url)}")
-                    if cb_resp.status >= 400:
-                        raise RuntimeError(f"OAuth 回调失败（HTTP {cb_resp.status}）")
-                # 5. 调 API 获取邀请码
-                async with s.get(HELP_BASE + "/api/invite") as inv_resp:
-                    status = inv_resp.status
-                    inv_data = await inv_resp.json(content_type=None)
-                    debug.append(f"✅ API: HTTP {status} -> {inv_data}")
-                if inv_data.get("success"):
-                    code = inv_data.get("code") or inv_data.get("invite_code") or inv_data.get("data", {}).get("code", "")
+                    m = re.search(r'id="csrfToken" value="([^"]+)"', body)
+                    if not m:
+                        yield event.plain_result("❌ 无法获取 CSRF token，请重新 /help_login")
+                        return
+                    csrf = m.group(1)
+                # 创建邀请码
+                post_headers = {"Cookie": f"PHPSESSID={help_session}", "X-Requested-With": "XMLHttpRequest"}
+                async with s.post(HELP_BASE + "/user/invite_api?action=create",
+                    json={"csrf_token": csrf},
+                    headers=post_headers) as resp:
+                    data = await resp.json(content_type=None)
+                if data.get("success"):
+                    code = data.get("invite", {}).get("code") or data.get("code", "")
                     yield event.plain_result(
                         f"✅ 邀请码申请成功！\n\n"
                         f"邀请码：{code}\n"
                         f"注册地址：{HELP_BASE}/register?code={code}"
                     )
                 else:
-                    msg = inv_data.get("msg") or str(inv_data)
-                    yield event.plain_result(
-                        f"❌ 获取邀请码失败（HTTP {status}）：{msg}\n\n"
-                        f"【调试信息】\n" + "\n".join(debug)
-                    )
+                    yield event.plain_result(f"❌ {data.get('msg', '申请失败')}")
         except Exception as exc:
+            yield event.plain_result(f"❌ 申请邀请码异常：{err(exc)}")
+
+    @filter.command("help_login", alias={"登录帮助站", "帮助站登录"})
+    async def help_login(self, event: AstrMessageEvent):
+        """配置帮助站登录 session"""
+        msg = event.message_str.strip()
+        # 提取 session 值
+        session_val = msg.replace("/help_login", "").replace("登录帮助站", "").replace("帮助站登录", "").strip()
+        if session_val:
+            try:
+                from astrbot.core.star.config import update_config
+                update_config("astrbot_plugin_aicue_forum_config", "help_session", session_val)
+                self.config["help_session"] = session_val
+                yield event.plain_result("✅ 帮助站 session 已保存！现在可以使用 /邀请码 了")
+            except Exception as e:
+                yield event.plain_result(f"❌ 保存失败：{err(e)}")
+        else:
             yield event.plain_result(
-                f"❌ 申请邀请码异常：{err(exc)}\n\n"
-                f"【调试信息】\n" + "\n".join(debug)
+                "📋 请按以下步骤操作：\n\n"
+                "1. 浏览器打开 https://help.aicue.top/user/invite\n"
+                "2. 用论坛账号登录并授权\n"
+                "3. 按 F12 → Application → Cookies → help.aicue.top\n"
+                "4. 复制 PHPSESSID 的值\n"
+                "5. 发送：/help_login 你的PHPSESSID值"
             )
 
     @filter.command("my_invite_codes", alias={"我的邀请码"})
