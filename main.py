@@ -1343,8 +1343,8 @@ class AicueForumPlugin(Star):
                     oauth_csrf = m.group(1) if m else csrf
                     debug.append(f"✅ OAuth GET: {pre_resp.status} (CSRF: {oauth_csrf[:16]}...)")
                 async with s.post(auth_url,
-                    data={"authorization": "approve", "csrfToken": oauth_csrf},
-                    headers={"X-CSRF-Token": oauth_csrf},
+                    json={"authorization": "approve"},
+                    headers={"X-CSRF-Token": oauth_csrf, "Content-Type": "application/json"},
                     allow_redirects=False) as resp:
                     debug.append(f"✅ OAuth POST: {resp.status}")
                     if resp.status not in (302, 303):
@@ -1422,8 +1422,8 @@ class AicueForumPlugin(Star):
                     m2 = re.search(r'"csrfToken":"([^"]+)"', pre_body2)
                     oauth_csrf2 = m2.group(1) if m2 else csrf
                 async with s.post(auth_url,
-                    data={"authorization": "approve", "csrfToken": oauth_csrf2},
-                    headers={"X-CSRF-Token": oauth_csrf2},
+                    json={"authorization": "approve"},
+                    headers={"X-CSRF-Token": oauth_csrf2, "Content-Type": "application/json"},
                     allow_redirects=False) as resp:
                     if resp.status not in (302, 303):
                         raise RuntimeError(f"OAuth 授权失败（HTTP {resp.status}）")
