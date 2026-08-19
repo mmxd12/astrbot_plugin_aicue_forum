@@ -1481,9 +1481,9 @@ class AicueForumPlugin(Star):
                     data = await resp.json(content_type=None)
                 if data.get("success"):
                     stats = data.get("stats", {})
-                    codes = data.get("codes", data.get("invite_codes", []))
-                    total = stats.get('total_codes', '?')
-                    used_codes = [c['code'] for c in codes if c.get('used', c.get('is_used', False))]
+                    codes = data.get("invites", data.get("codes", data.get("invite_codes", [])))
+                    total = stats.get('total_codes', len(codes) if codes else '?')
+                    used_codes = [c.get('code', '?') for c in codes if c.get('used_count', 0) > 0 or c.get('used', c.get('is_used', False))]
                     remaining = data.get('remaining', '?')
                     if used_codes:
                         if len(used_codes) > 4:
