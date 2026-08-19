@@ -1292,32 +1292,53 @@ class AicueForumPlugin(Star):
     async def invite_code(self, event: AstrMessageEvent):
         """自动申请一个言灵工坊邀请码"""
         try:
+            import urllib.parse
+            from urllib.parse import urlparse
             session = await self.client()
             # 1. 登录论坛
             await self.login()
-            # 2. 走 OAuth 流程获取帮助站 session
-            # 构造 OAuth authorize URL
+            # 2. 把论坛 session cookie 复制到 flarum.aicue.top 域
+            flarum_domain = "flarum.aicue.top"
+            forum_cookies = session.cookie_jar.filter_cookies("https://www.aicue.top/")
+            flarum_session_cookie = forum_cookies.get("flarum_session")
+            flarum_csrf = ""
+            if flarum_session_cookie:
+                # 手动设置 flarum domain 的 cookie
+                session.cookie_jar.update_cookies(
+                    {"flarum_session": flarum_session_cookie.value},
+                    f"https://{flarum_domain}/"
+                )
+            # 获取 flarum 的 CSRF token
+            async with session.get(f"https://{flarum_domain}/") as resp:
+                body = await resp.text()
+                m = re.search(r'"csrfToken":"([^"]+)"', body)
+                if m:
+                    flarum_csrf = m.group(1)
+            # 3. 走 OAuth 流程
             oauth_params = {
                 "client_id": OAUTH_CLIENT_ID,
                 "redirect_uri": HELP_BASE + "/oauth/callback",
                 "response_type": "code",
                 "scope": "user.read",
             }
-            import urllib.parse
-            auth_url = "https://flarum.aicue.top/oauth/authorize?" + urllib.parse.urlencode(oauth_params)
-            # 访问 OAuth 授权页（带上论坛 cookie）
-            async with session.post(auth_url, data={"approve": "1"}) as resp:
-                if resp.status not in (200, 302):
+            auth_url = f"https://{flarum_domain}/oauth/authorize?" + urllib.parse.urlencode(oauth_params)
+            # 先 GET 到 OAuth 页面（带 cookie 会自动登录），再 POST approve
+            async with session.get(auth_url) as pre_resp:
+                pre_body = await pre_resp.text()
+            # POST 授权
+            headers = {"X-CSRF-Token": flarum_csrf} if flarum_csrf else {}
+            async with session.post(auth_url, data={"approve": "1"}, headers=headers) as resp:
+                if resp.status not in (200, 302, 303):
                     body = await resp.text()
-                    raise RuntimeError(f"OAuth 授权失败（HTTP {resp.status}）")
-                # 跟踪重定向到 help.aicue.top
+                    raise RuntimeError(f"OAuth 授权失败（HTTP {resp.status}）: {body[:200]}")
                 location = resp.headers.get("Location", "")
                 if location:
                     async with session.get(location) as cb_resp:
                         if cb_resp.status >= 400:
                             raise RuntimeError(f"OAuth 回调失败（HTTP {cb_resp.status}）")
-            # 3. 调用帮助站 API 获取邀请码
+            # 4. 调用帮助站 API 获取邀请码
             async with session.get(HELP_BASE + "/api/invite") as inv_resp:
+                status = inv_resp.status
                 inv_data = await inv_resp.json(content_type=None)
             if inv_data.get("success"):
                 code = inv_data.get("code") or inv_data.get("invite_code") or inv_data.get("data", {}).get("code", "")
@@ -1328,7 +1349,7 @@ class AicueForumPlugin(Star):
                 )
             else:
                 msg = inv_data.get("msg") or str(inv_data)
-                yield event.plain_result(f"❌ 获取邀请码失败：{msg}")
+                yield event.plain_result(f"❌ 获取邀请码失败（HTTP {status}）：{msg}")
         except Exception as exc:
             yield event.plain_result(f"❌ 申请邀请码异常：{err(exc)}")
 
