@@ -1328,8 +1328,8 @@ class AicueForumPlugin(Star):
         # PHPSESSID 无效或过期，用 Playwright 自动完成 OAuth 授权
         yield event.plain_result("🔄 登录 session 已过期，正在自动重新登录...")
         import asyncio
-        from playwright.sync_api import sync_playwright
-        import time, re as _re
+        from playwright.async_api import async_playwright
+        import asyncio as _asyncio, re as _re
         
         try:
             # 论坛登录
@@ -1346,43 +1346,44 @@ class AicueForumPlugin(Star):
                     forum_cookies[c.key] = c.value
             
             new_session = None
-            with sync_playwright() as pw:
-                browser = pw.chromium.launch(headless=True, args=['--no-sandbox'])
-                context = browser.new_context()
-                page = context.new_page()
+            async with async_playwright() as pw:
+                browser = await pw.chromium.launch(headless=True, args=['--no-sandbox'])
+                context = await browser.new_context()
+                page = await context.new_page()
                 
                 # 访问帮助站 → 点"用论坛账号登录"
-                page.goto(HELP_BASE + "/user/invite", wait_until="domcontentloaded", timeout=30000)
-                time.sleep(3)
+                await page.goto(HELP_BASE + "/user/invite", wait_until="domcontentloaded", timeout=30000)
+                await _asyncio.sleep(3)
                 login_btn = page.locator("a.btn-login")
-                if login_btn.is_visible():
-                    login_btn.click()
-                    time.sleep(5)
+                if await login_btn.is_visible():
+                    await login_btn.click()
+                    await _asyncio.sleep(5)
                 
                 # 设置论坛 cookie
                 for name, value in forum_cookies.items():
-                    context.add_cookies([{
+                    await context.add_cookies([{
                         "name": name, "value": value,
                         "domain": "flarum.aicue.top", "path": "/",
                         "httpOnly": True, "secure": True, "sameSite": "Lax"
                     }])
                 
                 # 刷新 OAuth 页
-                page.goto(page.url, wait_until="domcontentloaded", timeout=60000)
-                time.sleep(8)
+                await page.goto(page.url, wait_until="domcontentloaded", timeout=60000)
+                await _asyncio.sleep(8)
                 
                 # 点 Agree
                 agree = page.locator('button:has-text("Agree")')
-                if agree.is_visible():
-                    agree.click()
-                    time.sleep(5)
+                if await agree.is_visible():
+                    await agree.click()
+                    await _asyncio.sleep(5)
                 
                 # 获取新 PHPSESSID
-                for c in context.cookies():
+                cookies = await context.cookies()
+                for c in cookies:
                     if c["domain"] == "help.aicue.top" and c["name"] == "PHPSESSID":
                         new_session = c["value"]
                 
-                browser.close()
+                await browser.close()
             
             if new_session:
                 # 保存到配置
