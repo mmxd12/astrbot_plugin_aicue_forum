@@ -1443,77 +1443,38 @@ class AicueForumPlugin(Star):
     @filter.command("my_invite_codes", alias={"我的邀请码"})
     async def my_invite_codes(self, event: AstrMessageEvent):
         """查看我申请的邀请码及使用状态"""
-        import urllib.parse
-        flarum_base = "https://flarum.aicue.top"
+        help_session = str(self.cfg("help_session", "")).strip()
+        if not help_session:
+            yield event.plain_result("❌ 未配置帮助站 session，请先发 /邀请码 自动登录")
+            return
         try:
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as s:
-                # 1. 登录 flarum
-                async with s.get(flarum_base + "/") as resp:
-                    body = await resp.text()
-                    m = re.search(r'"csrfToken":"([^"]+)"', body)
-                    csrf = m.group(1) if m else ""
-                username = str(self.cfg("forum_username", "")).strip()
-                password = str(self.cfg("forum_password", ""))
-                if not username or not password:
-                    yield event.plain_result("❌ 未配置论坛账号")
-                    return
-                async with s.post(flarum_base + "/login",
-                    json={"identification": username, "password": password, "remember": True},
-                    headers={"Accept": "application/vnd.api+json", "X-CSRF-Token": csrf}) as resp:
-                    if resp.status >= 400:
-                        raise RuntimeError(f"登录失败（HTTP {resp.status}）")
-                # 2. OAuth
-                async with s.get(flarum_base + "/") as resp:
-                    body = await resp.text()
-                    m = re.search(r'"csrfToken":"([^"]+)"', body)
-                    csrf = m.group(1) if m else ""
-                oauth_params = {
-                    "client_id": OAUTH_CLIENT_ID,
-                    "redirect_uri": HELP_BASE + "/oauth/callback",
-                    "response_type": "code",
-                    "scope": "user.read",
-                    "approval_prompt": "auto",
-                }
-                auth_url = flarum_base + "/oauth/authorize?" + urllib.parse.urlencode(oauth_params)
-                async with s.get(auth_url) as pre_resp2:
-                    pre_body2 = await pre_resp2.text()
-                    m2 = re.search(r'"csrfToken":"([^"]+)"', pre_body2)
-                    oauth_csrf2 = m2.group(1) if m2 else csrf
-                state_match2 = re.search(r'[?&]state=([^&]+)', auth_url)
-                oauth_state = state_match2.group(1) if state_match2 else ""
-                async with s.post(auth_url,
-                    data=f"authorization=approve&_token={oauth_csrf2}&state={oauth_state}",
-                    headers={"X-CSRF-Token": oauth_csrf2, "Content-Type": "application/x-www-form-urlencoded"},
-                    allow_redirects=False) as resp:
-                    if resp.status not in (302, 303):
-                        raise RuntimeError(f"OAuth 授权失败（HTTP {resp.status}）")
-                    location = resp.headers.get("Location", "")
-                    if not location:
-                        raise RuntimeError("OAuth 无重定向")
-                async with s.get(location, allow_redirects=True):
-                    pass
-                # 3. 获取邀请码列表（POST 方式试试）
-                async with s.get(HELP_BASE + "/api/invite") as inv_resp:
-                    inv_data = await inv_resp.json(content_type=None)
-                if isinstance(inv_data, list):
-                    lines = ["📋 我的邀请码"]
-                    for i, item in enumerate(inv_data, 1):
-                        code = item.get("code", "?")
-                        used = item.get("used", item.get("is_used", False))
-                        status_icon = "✅ 已使用" if used else "🟢 未使用"
-                        lines.append(f"  {i}. {code}  {status_icon}")
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as s:
+                ck = {"Cookie": f"PHPSESSID={help_session}"}
+                async with s.get(HELP_BASE + "/user/invite_api?action=info",
+                    headers={**ck, "X-Requested-With": "XMLHttpRequest"}) as resp:
+                    data = await resp.json(content_type=None)
+                if data.get("success"):
+                    stats = data.get("stats", {})
+                    codes = data.get("codes", data.get("invite_codes", []))
+                    lines = [
+                        "📋 我的邀请码",
+                        f"  总计：{stats.get('total_codes', '?')} 个",
+                        f"  已使用：{stats.get('used_codes', '?')} 个",
+                        f"  已邀请：{stats.get('invited_count', '?')} 人",
+                        f"  剩余配额：{data.get('remaining', '?')}",
+                    ]
+                    if codes:
+                        lines.append("")
+                        for i, item in enumerate(codes, 1):
+                            code = item.get("code", "?")
+                            used = item.get("used", item.get("is_used", False))
+                            status_icon = "✅" if used else "🟢"
+                            lines.append(f"  {status_icon} {code}")
                     yield event.plain_result("\n".join(lines))
-                elif inv_data.get("success"):
-                    code = inv_data.get("code", "?")
-                    used = inv_data.get("used", inv_data.get("is_used", False))
-                    status_icon = "✅ 已使用" if used else "🟢 未使用"
-                    yield event.plain_result(f"📋 邀请码：{code}\n状态：{status_icon}")
                 else:
-                    msg = inv_data.get("msg") or str(inv_data)
-                    yield event.plain_result(f"❌ 查询失败：{msg}")
+                    yield event.plain_result(f"❌ {data.get('msg', '查询失败')}")
         except Exception as exc:
             yield event.plain_result(f"❌ 查询异常：{err(exc)}")
-
     async def terminate(self):
         if self.task:
             self.task.cancel()
