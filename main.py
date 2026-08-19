@@ -1347,6 +1347,7 @@ class AicueForumPlugin(Star):
                     forum_cookies[c.key] = c.value
             
             new_session = None
+            new_csrf = None
             async with async_playwright() as pw:
                 browser = await pw.chromium.launch(headless=True, args=['--no-sandbox'])
                 context = await browser.new_context()
@@ -1376,9 +1377,22 @@ class AicueForumPlugin(Star):
                 agree = page.locator('button:has-text("Agree")')
                 if await agree.is_visible():
                     await agree.click(no_wait_after=True)
-                    await _asyncio.sleep(8)
+                # 等待跳回帮助站用户页，确保 OAuth 回调完成
+                try:
+                    await page.wait_for_url("**/user/**", timeout=60000)
+                except Exception:
+                    pass
+                await _asyncio.sleep(3)
                 
-                # 获取新 PHPSESSID
+                # 直接在当前浏览器会话访问 /user/invite 提取 CSRF
+                await page.goto(HELP_BASE + "/user/invite", wait_until="domcontentloaded", timeout=30000)
+                await _asyncio.sleep(3)
+                html_body = await page.content()
+                csrf_m = _re.search(r'id="csrfToken" value="([^"]+)"', html_body)
+                if csrf_m:
+                    new_csrf = csrf_m.group(1)
+                
+                # 获取 PHPSESSID（OAuth 完成后帮助站的 session）
                 cookies = await context.cookies()
                 for c in cookies:
                     if c["domain"] == "help.aicue.top" and c["name"] == "PHPSESSID":
@@ -1386,9 +1400,12 @@ class AicueForumPlugin(Star):
                 
                 await browser.close()
             
-            if new_session:
+            if new_session and new_csrf:
                 self.config["help_session"] = new_session
-                await _asyncio.sleep(3)
+                csrf = new_csrf
+            elif new_session:
+                self.config["help_session"] = new_session
+                await _asyncio.sleep(2)
                 csrf = None
                 for _ in range(3):
                     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as s:
