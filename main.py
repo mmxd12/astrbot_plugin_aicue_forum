@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import json
 import html
 import re
 import random
@@ -1386,36 +1387,39 @@ class AicueForumPlugin(Star):
                 await browser.close()
             
             if new_session:
-                # 保存到配置
                 self.config["help_session"] = new_session
-                # 直接调 API（不需要 CSRF，action=info 不需要 post）
-                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as s:
-                    ck = {"Cookie": f"PHPSESSID={new_session}"}
-                    async with s.get(HELP_BASE + "/user/invite_api?action=info",
-                        headers={**ck, "X-Requested-With": "XMLHttpRequest"}) as resp:
-                        info = await resp.json(content_type=None)
-                    if info.get("success"):
-                        # session 有效，获取 CSRF 创建邀请码
+                await _asyncio.sleep(3)
+                csrf = None
+                for _ in range(3):
+                    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as s:
+                        ck = {"Cookie": f"PHPSESSID={new_session}"}
                         async with s.get(HELP_BASE + "/user/invite", headers=ck) as resp:
                             body = await resp.text()
-                            m = _re.search(r'id="csrfToken" value="([^"]+)"', body)
+                        m = _re.search(r'id="csrfToken" value="([^"]+)"', body)
                         if m:
                             csrf = m.group(1)
-                            async with s.post(HELP_BASE + "/user/invite_api?action=create",
-                                json={"csrf_token": csrf},
-                                headers={"Cookie": f"PHPSESSID={new_session}", "X-Requested-With": "XMLHttpRequest"}) as resp2:
-                                data = await resp2.json(content_type=None)
-                            if data.get("success"):
-                                code = data.get("invite", {}).get("code") or data.get("code", "")
-                                yield event.plain_result(
-                                    f"✅ 邀请码申请成功！\n\n"
-                                    f"邀请码：{code}\n"
-                                    f"注册地址：{HELP_BASE}/register?code={code}"
-                                )
-                            else:
-                                yield event.plain_result(f"❌ {data.get('msg', '申请失败')}")
-                        else:
-                            yield event.plain_result("❌ OAuth 登录成功但无法获取 CSRF token")
+                            break
+                    await _asyncio.sleep(2)
+                if not csrf:
+                    yield event.plain_result("❌ OAuth 登录成功但无法获取 CSRF token，请重试")
+                    return
+                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as s:
+                    async with s.post(
+                        HELP_BASE + "/user/invite_api?action=create",
+                        json={"csrf_token": csrf},
+                        headers={"Cookie": f"PHPSESSID={new_session}", "X-Requested-With": "XMLHttpRequest"},
+                    ) as resp2:
+                        text = await resp2.text()
+                try:
+                    data = json.loads(text)
+                except (TypeError, ValueError):
+                    yield event.plain_result(f"❌ API 返回非 JSON：{text[:100] or '空响应'}")
+                    return
+                if data.get("success"):
+                    code = data.get("invite", {}).get("code") or data.get("code", "")
+                    yield event.plain_result(f"✅ 邀请码申请成功！\n\n邀请码：{code}\n注册地址：{HELP_BASE}/register?code={code}")
+                else:
+                    yield event.plain_result(f"❌ {data.get('msg', '申请失败')}")
             else:
                 yield event.plain_result("❌ OAuth 自动登录失败，请用 /help_login 手动配置 session")
         except Exception as exc:
