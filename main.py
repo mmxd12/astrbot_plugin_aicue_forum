@@ -1335,7 +1335,7 @@ class AicueForumPlugin(Star):
                 async with s.get(auth_url) as pre_resp:
                     debug.append(f"✅ OAuth GET: {pre_resp.status}")
                 async with s.post(auth_url,
-                    data={"approve": "1"},
+                    data={"authorization": "approve"},
                     headers={"X-CSRF-Token": csrf},
                     allow_redirects=False) as resp:
                     debug.append(f"✅ OAuth POST: {resp.status}")
@@ -1412,7 +1412,7 @@ class AicueForumPlugin(Star):
                 async with s.get(auth_url):
                     pass
                 async with s.post(auth_url,
-                    data={"approve": "1"},
+                    data={"authorization": "approve"},
                     headers={"X-CSRF-Token": csrf},
                     allow_redirects=False) as resp:
                     if resp.status not in (302, 303):
