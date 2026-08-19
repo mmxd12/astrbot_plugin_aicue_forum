@@ -1317,13 +1317,18 @@ class AicueForumPlugin(Star):
                     if resp.status >= 400:
                         body = await resp.text()[:100]
                         raise RuntimeError(f"登录国际版失败（HTTP {resp.status}）: {body}")
-                debug.append("✅ 登录 flarum 成功")
-                # 2. 再获取 CSRF
+                # 检查登录后的 cookie
+                login_cookies = s.cookie_jar.filter_cookies(flarum_base + "/")
+                has_session = "flarum_session" in login_cookies
+                debug.append(f"✅ 登录 flarum 成功 (session: {'有' if has_session else '无'})")
+                # 2. 再获取 CSRF + 检查 userId
                 async with s.get(flarum_base + "/") as resp:
                     body = await resp.text()
                     m = re.search(r'"csrfToken":"([^"]+)"', body)
                     csrf = m.group(1) if m else ""
-                debug.append(f"✅ CSRF: {csrf[:16]}...")
+                    m2 = re.search(r'"userId":(\d+)', body)
+                    uid = m2.group(1) if m2 else "?"
+                    debug.append(f"✅ CSRF: {csrf[:16]}... userId: {uid}")
                 # 3. OAuth 授权
                 oauth_params = {
                     "client_id": OAUTH_CLIENT_ID,
@@ -1335,7 +1340,7 @@ class AicueForumPlugin(Star):
                 async with s.get(auth_url) as pre_resp:
                     debug.append(f"✅ OAuth GET: {pre_resp.status}")
                 async with s.post(auth_url,
-                    data={"authorization": "approve"},
+                    data={"authorization": "approve", "_token": csrf},
                     headers={"X-CSRF-Token": csrf},
                     allow_redirects=False) as resp:
                     debug.append(f"✅ OAuth POST: {resp.status}")
@@ -1412,7 +1417,7 @@ class AicueForumPlugin(Star):
                 async with s.get(auth_url):
                     pass
                 async with s.post(auth_url,
-                    data={"authorization": "approve"},
+                    data={"authorization": "approve", "_token": csrf},
                     headers={"X-CSRF-Token": csrf},
                     allow_redirects=False) as resp:
                     if resp.status not in (302, 303):
