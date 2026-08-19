@@ -1371,11 +1371,11 @@ class AicueForumPlugin(Star):
                 await page.goto(page.url, wait_until="domcontentloaded", timeout=60000)
                 await _asyncio.sleep(8)
                 
-                # 点 Agree
+                # 点 Agree（不等待导航完成）
                 agree = page.locator('button:has-text("Agree")')
                 if await agree.is_visible():
-                    await agree.click()
-                    await _asyncio.sleep(5)
+                    await agree.click(no_wait_after=True)
+                    await _asyncio.sleep(8)
                 
                 # 获取新 PHPSESSID
                 cookies = await context.cookies()
@@ -1388,12 +1388,17 @@ class AicueForumPlugin(Star):
             if new_session:
                 # 保存到配置
                 self.config["help_session"] = new_session
-                # 调用 API
+                # 直接调 API（不需要 CSRF，action=info 不需要 post）
                 async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as s:
                     ck = {"Cookie": f"PHPSESSID={new_session}"}
-                    async with s.get(HELP_BASE + "/user/invite", headers=ck) as resp:
-                        body = await resp.text()
-                        m = _re.search(r'id="csrfToken" value="([^"]+)"', body)
+                    async with s.get(HELP_BASE + "/user/invite_api?action=info",
+                        headers={**ck, "X-Requested-With": "XMLHttpRequest"}) as resp:
+                        info = await resp.json(content_type=None)
+                    if info.get("success"):
+                        # session 有效，获取 CSRF 创建邀请码
+                        async with s.get(HELP_BASE + "/user/invite", headers=ck) as resp:
+                            body = await resp.text()
+                            m = _re.search(r'id="csrfToken" value="([^"]+)"', body)
                         if m:
                             csrf = m.group(1)
                             async with s.post(HELP_BASE + "/user/invite_api?action=create",
