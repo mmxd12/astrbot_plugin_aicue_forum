@@ -1529,6 +1529,7 @@ class AicueForumPlugin(Star):
                         f"未使用：{unused_str}",
                         f"剩余配额：{remaining}",
                     ]
+                    yield event.plain_result("\n".join(lines))
                 else:
                     yield event.plain_result(f"❌ {data.get('msg', '查询失败')}")
         except Exception as exc:
