@@ -129,5 +129,17 @@
     "type": "string",
     "default": "",
     "hint": "用于分类查询等场景的广告横幅图片。留空则使用默认图片。支持 imgbb、GitHub、sm.ms 等任意公网图片链接。"
+  },
+  "help_session": {
+    "description": "帮助站登录 session（PHPSESSID），自动维护，无需手动设置",
+    "type": "string",
+    "default": "",
+    "hint": "内部分享：由插件自动获取并保活"
+  },
+  "image_host_key": {
+    "description": "远端图床鉴权 Key（配置后图片走 POST /upload 上传）",
+    "type": "string",
+    "default": "",
+    "hint": "如 http://111.170.14.106:18666 图床的 x-key"
   }
 }
