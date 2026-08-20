@@ -1296,167 +1296,88 @@ class AicueForumPlugin(Star):
     @filter.command("invite_code", alias={"邀请码", "邀请"})
     async def invite_code(self, event: AstrMessageEvent):
         """自动申请一个言灵工坊邀请码"""
-        # 先尝试用缓存的 PHPSESSID
-        help_session = str(self.cfg("help_session", "")).strip()
-        if help_session:
-            try:
-                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as s:
-                    ck = {"Cookie": f"PHPSESSID={help_session}"}
-                    async with s.get(HELP_BASE + "/user/invite", headers=ck) as resp:
-                        body = await resp.text()
-                        m = re.search(r'id="csrfToken" value="([^"]+)"', body)
-                        if m:
-                            csrf = m.group(1)
-                            post_headers = {"Cookie": f"PHPSESSID={help_session}", "X-Requested-With": "XMLHttpRequest"}
-                            async with s.post(HELP_BASE + "/user/invite_api?action=create",
-                                json={"csrf_token": csrf},
-                                headers=post_headers) as resp2:
-                                data = await resp2.json(content_type=None)
-                            if data.get("success"):
-                                code = data.get("invite", {}).get("code") or data.get("code", "")
-                                yield event.plain_result(
-                                    f"✅ 邀请码申请成功！\n\n"
-                                    f"邀请码：{code}\n"
-                                    f"注册地址：{HELP_BASE}/register?code={code}"
-                                )
-                                return
-                            elif data.get("msg") and "次数" in data.get("msg", ""):
-                                yield event.plain_result(f"❌ {data['msg']}")
-                                return
-            except Exception:
-                pass  # session 过期，走 OAuth 重新登录
-        
-        # PHPSESSID 无效或过期，用 Playwright 自动完成 OAuth 授权
-        yield event.plain_result("🔄 登录 session 已过期，正在自动重新登录...")
-        import asyncio
-        try:
-            from playwright.async_api import async_playwright
-        except ImportError:
-            yield event.plain_result(
-                "❌ 环境无 Playwright，无法自动登录。\n"
-                "请手动用浏览器登录帮助站后，发 /help_login 你的PHPSESSID"
-            )
-            return
-        import asyncio as _asyncio, re as _re
+        import urllib.parse, asyncio as _asyncio, re as _re
         
         try:
-            # 论坛登录
+            # 1. 访问帮助站获取 PHPSESSID + 授权链接
             async with aiohttp.ClientSession() as s:
-                async with s.get("https://flarum.aicue.top/") as resp:
-                    body = await resp.text()
-                    csrf = _re.search(r'"csrfToken":"([^"]+)"', body).group(1)
-                async with s.post("https://flarum.aicue.top/login",
-                    json={"identification": str(self.cfg("forum_username", "")), "password": str(self.cfg("forum_password", "")), "remember": True},
-                    headers={"Accept": "application/vnd.api+json", "X-CSRF-Token": csrf}) as resp:
-                    pass
-                forum_cookies = {}
-                for c in s.cookie_jar:
-                    forum_cookies[c.key] = c.value
-            
-            new_session = None
-            new_csrf = None
-            async with async_playwright() as pw:
-                browser = await pw.chromium.launch(headless=True, args=['--no-sandbox'])
-                context = await browser.new_context()
-                page = await context.new_page()
-                
-                # 访问帮助站 → 点"用论坛账号登录"
-                await page.goto(HELP_BASE + "/user/invite", wait_until="domcontentloaded", timeout=30000)
-                await _asyncio.sleep(3)
-                login_btn = page.locator("a.btn-login")
-                if await login_btn.is_visible():
-                    await login_btn.click()
-                    await _asyncio.sleep(5)
-                
-                # 设置论坛 cookie
-                for name, value in forum_cookies.items():
-                    await context.add_cookies([{
-                        "name": name, "value": value,
-                        "domain": "flarum.aicue.top", "path": "/",
-                        "httpOnly": True, "secure": True, "sameSite": "Lax"
-                    }])
-                
-                # 刷新 OAuth 页
-                await page.goto(page.url, wait_until="domcontentloaded", timeout=60000)
-                await _asyncio.sleep(8)
-                
-                # 点 Agree
-                agree = page.locator('button:has-text("Agree")')
-                if await agree.is_visible():
-                    await agree.click(no_wait_after=True)
-                try:
-                    await page.wait_for_url("**/user/**", timeout=60000)
-                except Exception:
-                    pass
-                await _asyncio.sleep(3)
-                
-                # 提取 CSRF
-                await page.goto(HELP_BASE + "/user/invite", wait_until="domcontentloaded", timeout=30000)
-                await _asyncio.sleep(3)
-                html_body = await page.content()
-                csrf_m = _re.search(r'id="csrfToken" value="([^"]+)"', html_body)
-                if csrf_m:
-                    new_csrf = csrf_m.group(1)
-                
+                async with s.get(HELP_BASE + "/oauth/authorize", allow_redirects=False) as resp:
+                    if resp.status not in (302, 303):
+                        yield event.plain_result("❌ 无法获取授权链接")
+                        return
+                    location = resp.headers.get("Location", "")
+                    if not location:
+                        yield event.plain_result("❌ 授权链接为空")
+                        return
                 # 获取 PHPSESSID
-                cookies = await context.cookies()
-                for c in cookies:
-                    if c["domain"] == "help.aicue.top" and c["name"] == "PHPSESSID":
-                        new_session = c["value"]
-                
-                await browser.close()
+                phpsessid = None
+                for c in s.cookie_jar:
+                    if c.key == "PHPSESSID":
+                        phpsessid = c.value
+                        break
             
-            # 持久化到配置文件
-            if new_session and new_session != self.cfg("help_session", ""):
+            if not phpsessid:
+                yield event.plain_result("❌ 无法获取帮助站 session")
+                return
+            
+            # 2. 发送授权链接给用户
+            yield event.plain_result(
+                f"🔗 请点击下方链接完成授权：\n\n"
+                f"{location}\n\n"
+                f"⏳ 授权完成后我会自动获取邀请码..."
+            )
+            
+            # 3. 轮询 API 等待授权完成（最多等 120 秒）
+            for i in range(24):  # 24 * 5 = 120 秒
+                await _asyncio.sleep(5)
                 try:
-                    from astrbot.core.star.config import update_config
-                    update_config("astrbot_plugin_aicue_forum_config", "help_session", new_session)
+                    async with aiohttp.ClientSession() as s:
+                        ck = {"Cookie": f"PHPSESSID={phpsessid}"}
+                        async with s.get(HELP_BASE + "/user/invite_api?action=info",
+                            headers={**ck, "X-Requested-With": "XMLHttpRequest"}) as resp:
+                            text = await resp.text()
+                        data = _re.search(r'{"success"', text)
+                        if data:
+                            import json
+                            try:
+                                info = json.loads(text)
+                                if info.get("success"):
+                                    # 授权完成！获取 CSRF 创建邀请码
+                                    async with aiohttp.ClientSession() as s2:
+                                        ck2 = {"Cookie": f"PHPSESSID={phpsessid}"}
+                                        async with s2.get(HELP_BASE + "/user/invite", headers=ck2) as resp:
+                                            body = await resp.text()
+                                            m = _re.search(r'id="csrfToken" value="([^"]+)"', body)
+                                        if m:
+                                            csrf = m.group(1)
+                                            async with s2.post(HELP_BASE + "/user/invite_api?action=create",
+                                                json={"csrf_token": csrf},
+                                                headers={"Cookie": f"PHPSESSID={phpsessid}", "X-Requested-With": "XMLHttpRequest"}) as resp2:
+                                                text2 = await resp2.text()
+                                            try:
+                                                data2 = json.loads(text2)
+                                                if data2.get("success"):
+                                                    code = data2.get("invite", {}).get("code") or data2.get("code", "")
+                                                    yield event.plain_result(
+                                                        f"✅ 邀请码申请成功！\n\n"
+                                                        f"邀请码：{code}\n"
+                                                        f"注册地址：{HELP_BASE}/register?code={code}"
+                                                    )
+                                                else:
+                                                    yield event.plain_result(f"❌ {data2.get('msg', '申请失败')}")
+                                            except:
+                                                yield event.plain_result(f"❌ API 返回异常：{text2[:100]}")
+                                        else:
+                                            yield event.plain_result("❌ 授权成功但无法获取 CSRF token")
+                                    return
+                            except:
+                                pass
                 except Exception:
                     pass
-                self.config["help_session"] = new_session
             
-            if new_session and new_csrf:
-                self.config["help_session"] = new_session
-                csrf = new_csrf
-            elif new_session:
-                self.config["help_session"] = new_session
-                await _asyncio.sleep(2)
-                csrf = None
-                for _ in range(3):
-                    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as s:
-                        ck = {"Cookie": f"PHPSESSID={new_session}"}
-                        async with s.get(HELP_BASE + "/user/invite", headers=ck) as resp:
-                            body = await resp.text()
-                        m = _re.search(r'id="csrfToken" value="([^"]+)"', body)
-                        if m:
-                            csrf = m.group(1)
-                            break
-                    await _asyncio.sleep(2)
-                if not csrf:
-                    yield event.plain_result("❌ OAuth 登录成功但无法获取 CSRF token，请重试")
-                    return
-                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as s:
-                    async with s.post(
-                        HELP_BASE + "/user/invite_api?action=create",
-                        json={"csrf_token": csrf},
-                        headers={"Cookie": f"PHPSESSID={new_session}", "X-Requested-With": "XMLHttpRequest"},
-                    ) as resp2:
-                        text = await resp2.text()
-                try:
-                    data = json.loads(text)
-                except (TypeError, ValueError):
-                    yield event.plain_result(f"❌ API 返回非 JSON：{text[:100] or '空响应'}")
-                    return
-                if data.get("success"):
-                    code = data.get("invite", {}).get("code") or data.get("code", "")
-                    yield event.plain_result(f"✅ 邀请码申请成功！\n\n邀请码：{code}\n注册地址：{HELP_BASE}/register?code={code}")
-                else:
-                    yield event.plain_result(f"❌ {data.get('msg', '申请失败')}")
-            else:
-                yield event.plain_result("❌ OAuth 自动登录失败，请用 /help_login 手动配置 session")
+            yield event.plain_result("⏰ 授权超时，请重新发送 /邀请码")
         except Exception as exc:
-            yield event.plain_result(f"❌ 自动登录异常：{err(exc)}")
-
+            yield event.plain_result(f"❌ 异常：{err(exc)}")
     @filter.command("help_login", alias={"登录帮助站", "帮助站登录"})
     async def help_login(self, event: AstrMessageEvent):
         """配置帮助站登录 session"""
