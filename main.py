@@ -1416,22 +1416,44 @@ class AicueForumPlugin(Star):
             except Exception:
                 pass
             
-            # 调 API 创建邀请码（重试 3 次）
-            for attempt in range(3):
-                await _asyncio.sleep(2)
-                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as s:
-                    ck = {"Cookie": f"PHPSESSID={new_session}"}
-                    async with s.get(HELP_BASE + "/user/invite", headers=ck) as resp:
-                        body = await resp.text()
-                        m = _re.search(r'id="csrfToken" value="([^"]+)"', body)
-                    if m:
-                        csrf = m.group(1)
-                        async with s.post(HELP_BASE + "/user/invite_api?action=create",
-                            json={"csrf_token": csrf},
-                            headers={"Cookie": f"PHPSESSID={new_session}", "X-Requested-With": "XMLHttpRequest"}) as resp2:
-                            text = await resp2.text()
-                        try:
-                            data = _json.loads(text)
+            # 先等 OAuth 回调完全落地
+            await _asyncio.sleep(5)
+            
+            # 验证 session 是否已生效（最多等 60 秒）
+            session_ok = False
+            for attempt in range(12):
+                try:
+                    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as s:
+                        ck = {"Cookie": f"PHPSESSID={new_session}"}
+                        async with s.get(HELP_BASE + "/user/invite_api?action=info",
+                            headers={**ck, "X-Requested-With": "XMLHttpRequest"}) as resp:
+                            text = await resp.text()
+                        if '"success"' in text:
+                            session_ok = True
+                            break
+                except Exception:
+                    pass
+                await _asyncio.sleep(5)
+            
+            if not session_ok:
+                yield event.plain_result("❌ 授权完成但 session 未生效，请重试")
+                return
+            
+            # session 有效，获取 CSRF 创建邀请码（最多重试 5 次）
+            for attempt in range(5):
+                try:
+                    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as s:
+                        ck = {"Cookie": f"PHPSESSID={new_session}"}
+                        async with s.get(HELP_BASE + "/user/invite", headers=ck) as resp:
+                            body = await resp.text()
+                            m = _re.search(r'id="csrfToken" value="([^"]+)"', body)
+                        if m:
+                            csrf = m.group(1)
+                            async with s.post(HELP_BASE + "/user/invite_api?action=create",
+                                json={"csrf_token": csrf},
+                                headers={"Cookie": f"PHPSESSID={new_session}", "X-Requested-With": "XMLHttpRequest"}) as resp2:
+                                text2 = await resp2.text()
+                            data = _json.loads(text2)
                             if data.get("success"):
                                 code = data.get("invite", {}).get("code") or data.get("code", "")
                                 yield event.plain_result(
@@ -1442,9 +1464,10 @@ class AicueForumPlugin(Star):
                             else:
                                 yield event.plain_result(f"❌ {data.get('msg', '申请失败')}")
                             return
-                        except Exception:
-                            pass
-            yield event.plain_result("❌ 登录成功但 API 调用失败，请重试")
+                except Exception:
+                    pass
+                await _asyncio.sleep(3)
+            yield event.plain_result("❌ 登录成功但创建邀请码失败，请重试")
         except Exception as exc:
             yield event.plain_result(f"❌ 自动登录异常：{err(exc)}")
 
