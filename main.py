@@ -1296,10 +1296,11 @@ class AicueForumPlugin(Star):
     @filter.command("invite_code", alias={"邀请码", "邀请"})
     async def invite_code(self, event: AstrMessageEvent):
         """自动申请一个言灵工坊邀请码"""
-        import urllib.parse, asyncio as _asyncio, re as _re
+        import urllib.parse, asyncio as _asyncio, re as _re, json
+        from astrbot.core.message.message_event_result import MessageChain
         
         try:
-            # 1. 访问帮助站获取 PHPSESSID + 授权链接
+            # 1. 获取授权链接 + PHPSESSID
             async with aiohttp.ClientSession() as s:
                 async with s.get(HELP_BASE + "/oauth/authorize", allow_redirects=False) as resp:
                     if resp.status not in (302, 303):
@@ -1309,7 +1310,6 @@ class AicueForumPlugin(Star):
                     if not location:
                         yield event.plain_result("❌ 授权链接为空")
                         return
-                # 获取 PHPSESSID
                 phpsessid = None
                 for c in s.cookie_jar:
                     if c.key == "PHPSESSID":
@@ -1320,58 +1320,65 @@ class AicueForumPlugin(Star):
                 yield event.plain_result("❌ 无法获取帮助站 session")
                 return
             
-            # 2. 发送授权链接给用户
-            yield event.plain_result(
-                f"🔗 请点击下方链接完成授权：\n\n"
-                f"{location}\n\n"
-                f"⏳ 授权完成后我会自动获取邀请码..."
-            )
+            # 2. 尝试私聊发送授权链接
+            openid = event.get_sender_id()
+            priv_session = f"qqofficial:{openid}:friend"
+            link_msg = f"🔗 请点击链接完成授权：\n{location}\n\n授权完成后我会自动获取邀请码"
             
-            # 3. 轮询 API 等待授权完成（最多等 120 秒）
-            for i in range(24):  # 24 * 5 = 120 秒
+            sent_priv = False
+            try:
+                await self.context.send_message(priv_session, MessageChain().message(link_msg))
+                sent_priv = True
+                yield event.plain_result("✅ 授权链接已私聊发送，请查看私聊消息完成授权")
+            except Exception as e:
+                logger.warning(f"私聊发送失败: {e}")
+                # 私聊失败，群内回复完整链接
+                yield event.plain_result(
+                    f"🔗 请点击链接完成授权：\n{location}\n\n"
+                    f"（链接较长，建议复制到浏览器打开）\n"
+                    f"授权完成后我会自动获取邀请码"
+                )
+            
+            # 3. 轮询等待授权完成（最多 120 秒）
+            for i in range(24):
                 await _asyncio.sleep(5)
                 try:
-                    async with aiohttp.ClientSession() as s:
+                    async with aiohttp.ClientSession() as s2:
                         ck = {"Cookie": f"PHPSESSID={phpsessid}"}
-                        async with s.get(HELP_BASE + "/user/invite_api?action=info",
+                        async with s2.get(HELP_BASE + "/user/invite_api?action=info",
                             headers={**ck, "X-Requested-With": "XMLHttpRequest"}) as resp:
                             text = await resp.text()
-                        data = _re.search(r'{"success"', text)
-                        if data:
-                            import json
-                            try:
-                                info = json.loads(text)
-                                if info.get("success"):
-                                    # 授权完成！获取 CSRF 创建邀请码
-                                    async with aiohttp.ClientSession() as s2:
-                                        ck2 = {"Cookie": f"PHPSESSID={phpsessid}"}
-                                        async with s2.get(HELP_BASE + "/user/invite", headers=ck2) as resp:
-                                            body = await resp.text()
-                                            m = _re.search(r'id="csrfToken" value="([^"]+)"', body)
-                                        if m:
-                                            csrf = m.group(1)
-                                            async with s2.post(HELP_BASE + "/user/invite_api?action=create",
-                                                json={"csrf_token": csrf},
-                                                headers={"Cookie": f"PHPSESSID={phpsessid}", "X-Requested-With": "XMLHttpRequest"}) as resp2:
-                                                text2 = await resp2.text()
-                                            try:
-                                                data2 = json.loads(text2)
-                                                if data2.get("success"):
-                                                    code = data2.get("invite", {}).get("code") or data2.get("code", "")
-                                                    yield event.plain_result(
-                                                        f"✅ 邀请码申请成功！\n\n"
-                                                        f"邀请码：{code}\n"
-                                                        f"注册地址：{HELP_BASE}/register?code={code}"
-                                                    )
-                                                else:
-                                                    yield event.plain_result(f"❌ {data2.get('msg', '申请失败')}")
-                                            except:
-                                                yield event.plain_result(f"❌ API 返回异常：{text2[:100]}")
-                                        else:
-                                            yield event.plain_result("❌ 授权成功但无法获取 CSRF token")
-                                    return
-                            except:
-                                pass
+                        if '"success"' in text:
+                            info = json.loads(text)
+                            if info.get("success"):
+                                # 授权完成！获取 CSRF 创建邀请码
+                                async with aiohttp.ClientSession() as s3:
+                                    ck3 = {"Cookie": f"PHPSESSID={phpsessid}"}
+                                    async with s3.get(HELP_BASE + "/user/invite", headers=ck3) as resp:
+                                        body = await resp.text()
+                                        m = _re.search(r'id="csrfToken" value="([^"]+)"', body)
+                                    if m:
+                                        csrf = m.group(1)
+                                        async with s3.post(HELP_BASE + "/user/invite_api?action=create",
+                                            json={"csrf_token": csrf},
+                                            headers={"Cookie": f"PHPSESSID={phpsessid}", "X-Requested-With": "XMLHttpRequest"}) as resp2:
+                                            text2 = await resp2.text()
+                                        try:
+                                            data2 = json.loads(text2)
+                                            if data2.get("success"):
+                                                code = data2.get("invite", {}).get("code") or data2.get("code", "")
+                                                yield event.plain_result(
+                                                    f"✅ 邀请码申请成功！\n\n"
+                                                    f"邀请码：{code}\n"
+                                                    f"注册地址：{HELP_BASE}/register?code={code}"
+                                                )
+                                            else:
+                                                yield event.plain_result(f"❌ {data2.get('msg', '申请失败')}")
+                                        except:
+                                            yield event.plain_result(f"❌ API 返回异常：{text2[:100]}")
+                                    else:
+                                        yield event.plain_result("❌ 授权成功但无法获取 CSRF token")
+                                return
                 except Exception:
                     pass
             
