@@ -1505,23 +1505,30 @@ class AicueForumPlugin(Star):
                     codes = data.get("invites", data.get("codes", data.get("invite_codes", [])))
                     total = stats.get('total_codes', len(codes) if codes else '?')
                     used_codes = [c.get('code', '?') for c in codes if c.get('used_count', 0) > 0 or c.get('used', c.get('is_used', False))]
+                    unused_codes = [c.get('code', '?') for c in codes if c.get('used_count', 0) <= 0 and not c.get('used', c.get('is_used', False))]
                     remaining = data.get('remaining', '?')
+                    # 已使用列表：每4个换行
                     if used_codes:
-                        if len(used_codes) > 4:
-                            parts = []
-                            for i in range(0, len(used_codes), 4):
-                                parts.append("，".join(used_codes[i:i+4]))
-                            used_str = "，" + "\n".join(parts)
-                        else:
-                            used_str = "，".join(used_codes)
+                        used_lines = []
+                        for i in range(0, len(used_codes), 4):
+                            used_lines.append("，".join(used_codes[i:i+4]))
+                        used_str = "，" + "\n".join(used_lines)
                     else:
                         used_str = "无"
+                    # 未使用列表：每4个换行
+                    if unused_codes:
+                        unused_lines = []
+                        for i in range(0, len(unused_codes), 4):
+                            unused_lines.append("，".join(unused_codes[i:i+4]))
+                        unused_str = "，" + "\n".join(unused_lines)
+                    else:
+                        unused_str = "无"
                     lines = [
                         f"邀请码总计：{total}个",
                         f"已使用：{used_str}",
+                        f"未使用：{unused_str}",
                         f"剩余配额：{remaining}",
                     ]
-                    yield event.plain_result("\n".join(lines))
                 else:
                     yield event.plain_result(f"❌ {data.get('msg', '查询失败')}")
         except Exception as exc:
