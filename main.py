@@ -1329,7 +1329,14 @@ class AicueForumPlugin(Star):
         # PHPSESSID 无效或过期，用 Playwright 自动完成 OAuth 授权
         yield event.plain_result("🔄 登录 session 已过期，正在自动重新登录...")
         import asyncio
-        from playwright.async_api import async_playwright
+        try:
+            from playwright.async_api import async_playwright
+        except ImportError:
+            yield event.plain_result(
+                "❌ 环境无 Playwright，无法自动登录。\n"
+                "请手动用浏览器登录帮助站后，发 /help_login 你的PHPSESSID"
+            )
+            return
         import asyncio as _asyncio, re as _re
         
         try:
@@ -1373,18 +1380,17 @@ class AicueForumPlugin(Star):
                 await page.goto(page.url, wait_until="domcontentloaded", timeout=60000)
                 await _asyncio.sleep(8)
                 
-                # 点 Agree（不等待导航完成）
+                # 点 Agree
                 agree = page.locator('button:has-text("Agree")')
                 if await agree.is_visible():
                     await agree.click(no_wait_after=True)
-                # 等待跳回帮助站用户页，确保 OAuth 回调完成
                 try:
                     await page.wait_for_url("**/user/**", timeout=60000)
                 except Exception:
                     pass
                 await _asyncio.sleep(3)
                 
-                # 直接在当前浏览器会话访问 /user/invite 提取 CSRF
+                # 提取 CSRF
                 await page.goto(HELP_BASE + "/user/invite", wait_until="domcontentloaded", timeout=30000)
                 await _asyncio.sleep(3)
                 html_body = await page.content()
@@ -1392,13 +1398,22 @@ class AicueForumPlugin(Star):
                 if csrf_m:
                     new_csrf = csrf_m.group(1)
                 
-                # 获取 PHPSESSID（OAuth 完成后帮助站的 session）
+                # 获取 PHPSESSID
                 cookies = await context.cookies()
                 for c in cookies:
                     if c["domain"] == "help.aicue.top" and c["name"] == "PHPSESSID":
                         new_session = c["value"]
                 
                 await browser.close()
+            
+            # 持久化到配置文件
+            if new_session and new_session != self.cfg("help_session", ""):
+                try:
+                    from astrbot.core.star.config import update_config
+                    update_config("astrbot_plugin_aicue_forum_config", "help_session", new_session)
+                except Exception:
+                    pass
+                self.config["help_session"] = new_session
             
             if new_session and new_csrf:
                 self.config["help_session"] = new_session
