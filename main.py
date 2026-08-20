@@ -282,17 +282,46 @@ class AicueForumPlugin(Star):
         return base
 
     async def publish_image(self, image_bytes: bytes) -> str:
-        """写入本地文件服务目录，返回公网 URL"""
+        """写入本地文件服务目录或上传到远端图床，返回公网 URL"""
         base = self.image_base()
-        directory = Path(str(self.cfg("image_host_dir", IMAGE_HOST_DIR)))
-        await asyncio.to_thread(directory.mkdir, parents=True, exist_ok=True)
-        name = hashlib.sha1(image_bytes).hexdigest()[:16] + ".jpg"
-        path = directory / name
-        if not path.exists():
-            temporary = path.with_suffix(".tmp")
-            await asyncio.to_thread(temporary.write_bytes, image_bytes)
-            await asyncio.to_thread(temporary.replace, path)
-        return f"{base}/{name}"
+        # 远端图床：POST /upload 上传（带 x-key 鉴权），返回 JSON url
+        host_key = str(self.cfg("image_host_key", "")).strip()
+        try:
+            if host_key:
+                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as hs:
+                    async with hs.post(
+                        base.rstrip("/") + "/upload",
+                        data=image_bytes,
+                        headers={"x-key": host_key, "Content-Type": "image/jpeg"},
+                    ) as resp:
+                        if resp.status == 200:
+                            data = await resp.json(content_type=None)
+                            url = (data or {}).get("url", "")
+                            if url:
+                                return url
+                        logger.warning(f"[图床] 远端上传 HTTP {resp.status}: {await resp.text()[:100]}")
+            # 兜底：本地写盘
+            directory = Path(str(self.cfg("image_host_dir", IMAGE_HOST_DIR)))
+            await asyncio.to_thread(directory.mkdir, parents=True, exist_ok=True)
+            name = hashlib.sha1(image_bytes).hexdigest()[:16] + ".jpg"
+            path = directory / name
+            if not path.exists():
+                temporary = path.with_suffix(".tmp")
+                await asyncio.to_thread(temporary.write_bytes, image_bytes)
+                await asyncio.to_thread(temporary.replace, path)
+            return f"{base}/{name}"
+        except Exception as exc:
+            # 上传失败也退回本地
+            directory = Path(str(self.cfg("image_host_dir", IMAGE_HOST_DIR)))
+            await asyncio.to_thread(directory.mkdir, parents=True, exist_ok=True)
+            name = hashlib.sha1(image_bytes).hexdigest()[:16] + ".jpg"
+            path = directory / name
+            if not path.exists():
+                temporary = path.with_suffix(".tmp")
+                await asyncio.to_thread(temporary.write_bytes, image_bytes)
+                await asyncio.to_thread(temporary.replace, path)
+            logger.warning(f"[图床] 远端上传异常 {err(exc)}，已退回本地")
+            return f"{base}/{name}"
 
     async def screenshot_post(self, url: str):
         """截取帖子网页，返回 (JPEG 字节, 宽, 高)。"""
