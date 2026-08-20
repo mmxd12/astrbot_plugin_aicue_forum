@@ -1408,13 +1408,13 @@ class AicueForumPlugin(Star):
                 yield event.plain_result("❌ OAuth 自动登录失败，请稍后重试")
                 return
             
-            # 保存 session 到内存 + 配置文件
-            self.config["help_session"] = new_session
+            # 保存 session 到内存 + 配置文件（AstrBotConfig 自带 save_config 持久化）
             try:
-                from astrbot.core.star.config import update_config
-                update_config("astrbot_plugin_aicue_forum_config", "help_session", new_session)
-            except Exception:
-                pass
+                self.config["help_session"] = new_session
+                if hasattr(self.config, "save_config"):
+                    self.config.save_config()
+            except Exception as e:
+                logger.warning(f"[邀请码] session 保存失败: {err(e)}")
             
             # 先等 OAuth 回调完全落地
             await _asyncio.sleep(5)
@@ -1476,7 +1476,7 @@ class AicueForumPlugin(Star):
         while True:
             await asyncio.sleep(1200)  # 20 分钟
             try:
-                help_session = str(self.cfg("help_session", "")).strip()
+                help_session = str(self.config.get("help_session", "") or "").strip()
                 if not help_session:
                     continue
                 async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as s:
