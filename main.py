@@ -1322,7 +1322,7 @@ class AicueForumPlugin(Star):
             
             # 2. 尝试私聊发送授权链接
             openid = event.get_sender_id()
-            priv_session = f"qqofficial:{openid}:friend"
+            priv_session = f"{event.session.platform_name}:FriendMessage:{openid}"
             link_msg = f"🔗 请点击链接完成授权：\n{location}\n\n授权完成后我会自动获取邀请码"
             
             sent_priv = False
